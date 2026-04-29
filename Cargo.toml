@@ -1,0 +1,37 @@
+[package]
+name = "rustnps"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.76"
+description = "Rust reconstruction of the core nps/npc intranet proxy runtime"
+license = "MIT"
+
+[lib]
+name = "rustnps"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nps"
+path = "src/bin/nps.rs"
+
+[[bin]]
+name = "npc"
+path = "src/bin/npc.rs"
+
+[dependencies]
+base64 = "0.22"
+md5 = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+axum-extra = { version = "0.9", features = ["cookie"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+sysinfo = "0.30"
+chrono = "0.4"
+rustls = "0.23"
+rustls-pemfile = "2"
+snap = "1"
+rcgen = "0.13"
+
+[dev-dependencies]

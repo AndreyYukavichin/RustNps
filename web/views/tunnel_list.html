@@ -1,0 +1,42 @@
+<div class="wrapper wrapper-content animated fadeInRight"><div class="row"><div class="col-lg-12"><div class="ibox float-e-margins">
+<div class="ibox-title"><h5><span langtag="page-list{{kind}}"></span><span> {{name}}</span></h5><div class="ibox-tools"><a class="collapse-link"><i class="fa fa-chevron-up"></i></a><a class="close-link"><i class="fa fa-times"></i></a></div></div>
+<div class="content"><div class="table-responsive"><div id="toolbar"><a href="{{base}}/index/add?type={{kind}}&client_id={{client_id}}" class="btn btn-primary dim"><i class="fa fa-fw fa-lg fa-plus"></i> <span langtag="word-add"></span></a></div><table id="table"></table></div></div>
+</div></div></div></div>
+<script>
+$("#table").bootstrapTable({
+    toolbar:"#toolbar", method:"post", url:"{{base}}/index/gettunnel", contentType:"application/x-www-form-urlencoded",
+    queryParams:function(params){ var kind = "{{kind}}"; if(kind === "all") kind = ""; return {offset:params.offset, limit:params.limit, type:kind, client_id:"{{client_id}}", search:params.search, sort:params.sort, order:params.order}; },
+    striped:true, search:true, showHeader:true, showColumns:true, showRefresh:true, pagination:true, sidePagination:"server",
+    pageList:[5,10,20,50], detailView:true, smartDisplay:true, onPostBody:function(){ $("body").setLang("#table"); },
+    detailFormatter:function(index,row){
+        let tmp='<b langtag="word-exportflow"></b>: '+changeunit(row.Flow.ExportFlow)+'&emsp;'
+            + '<b langtag="word-inletflow"></b>: '+changeunit(row.Flow.InletFlow)+'&emsp;'
+            + '<b langtag="word-crypt"></b>: '+row.Client.Cnf.Crypt+'&emsp;'
+            + '<b langtag="word-compress"></b>: '+row.Client.Cnf.Compress+'&emsp;';
+        if(row.Mode=="secret" || row.Mode=="p2p") tmp += '<br><br><b langtag="word-commandaccess"></b>: <code>./npc -server='+row.Command.Server+' -vkey='+row.Client.VerifyKey+' -password='+row.Password+' -local_type='+row.Mode+'</code>';
+        return tmp;
+    },
+    columns:[
+        {field:"Id", title:'<span langtag="word-id"></span>', sortable:true},
+        {field:"ClientId", title:'<span langtag="word-clientid"></span>', formatter:function(v,row){ return row.Client.Id+"-"+row.Client.Remark; }},
+        {field:"Remark", title:'<span langtag="word-remark"></span>'},
+        {field:"Client.VerifyKey", title:'<span langtag="word-verifykey"></span>', formatter:function(v,row){ return row.Client.VerifyKey; }},
+        {field:"Mode", title:'<span langtag="word-scheme"></span>', formatter:function(v){ return '<span langtag="scheme-'+v+'"></span>'; }},
+        {field:"Port", title:'<span langtag="word-port"></span>', sortable:true},
+        {field:"address", title:'<span langtag="word-accessaddress"></span>', formatter:function(v,row){ return row.Port ? '<a href="http://'+row.Command.Host+':'+row.Port+'" target="_blank">'+row.Command.Host+':'+row.Port+'</a>' : ""; }},
+        {field:"Target", title:'<span langtag="word-target"></span>', formatter:function(v,row){ return row.Target.TargetStr; }},
+        {field:"Password", title:'<span langtag="word-identificationkey"></span>'},
+        {field:"Status", title:'<span langtag="word-status"></span>', formatter:function(v){ return v ? '<span class="badge badge-primary" langtag="word-open"></span>' : '<span class="badge badge-badge" langtag="word-close"></span>'; }},
+        {field:"RunStatus", title:'<span langtag="word-runstatus"></span>', formatter:function(v){ return v ? '<span class="badge badge-primary" langtag="word-open"></span>' : '<span class="badge badge-badge" langtag="word-close"></span>'; }},
+        {field:"ClientStatus", title:'<span langtag="word-clientstatus"></span>', formatter:function(v,row){ return row.Client.IsConnect ? '<span class="badge badge-primary" langtag="word-online"></span>' : '<span class="badge badge-badge" langtag="word-offline"></span>'; }},
+        {field:"option", title:'<span langtag="word-option"></span>', formatter:function(v,row){
+            let btn='<div class="btn-group">';
+            btn += row.Status ? '<a onclick="submitform(\'stop\', \'{{base}}/index/stop\', {id:'+row.Id+'})" class="btn btn-outline btn-warning"><i class="fa fa-pause"></i></a>' : '<a onclick="submitform(\'start\', \'{{base}}/index/start\', {id:'+row.Id+'})" class="btn btn-outline btn-primary"><i class="fa fa-play"></i></a>';
+            btn += '<a onclick="submitform(\'delete\', \'{{base}}/index/del\', {id:'+row.Id+'})" class="btn btn-outline btn-danger"><i class="fa fa-trash"></i></a>';
+            btn += '<a href="{{base}}/index/edit?id='+row.Id+'" class="btn btn-outline btn-success"><i class="fa fa-edit"></i></a>';
+            btn += '<a onclick="submitform(\'copy\', \'{{base}}/index/copy\', {id:'+row.Id+'})" class="btn btn-outline btn-primary"><i class="fa fa-copy"></i></a></div>';
+            return btn;
+        }}
+    ]
+});
+</script>

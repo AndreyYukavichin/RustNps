@@ -1,0 +1,9 @@
+<div class="wrapper wrapper-content animated fadeInRight"><div class="row"><div class="col-lg-8"><div class="ibox float-e-margins">
+<div class="ibox-title"><h5 langtag="word-globalparam"></h5></div>
+<div class="ibox-content">
+<form id="globalForm" onsubmit="submitform('global','{{base}}/global/save',$('#globalForm').serializeArray()); return false;">
+<div class="form-group"><label>Server URL</label><input class="form-control" name="serverUrl" value="{{server_url}}"></div>
+<div class="form-group"><label>Global Black IP List</label><textarea class="form-control" name="globalBlackIpList" rows="8">{{global_black_ip_list}}</textarea></div>
+<button class="btn btn-primary" type="submit" langtag="word-save"></button>
+</form>
+</div></div></div></div></div>

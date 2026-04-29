@@ -1,0 +1,194 @@
+<div class="wrapper wrapper-content">
+    <div class="row">
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-connectionport"></h5></div><div class="ibox-content"><h1 id="bridge-port" class="no-margins"></h1></div></div></div>
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-totalclients"></h5></div><div class="ibox-content"><h1 id="client-count" class="no-margins"></h1></div></div></div>
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-onlineclients"></h5></div><div class="ibox-content"><h1 id="online-count" class="no-margins"></h1></div></div></div>
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-tcpconnections"></h5></div><div class="ibox-content"><h1 id="tcp-count" class="no-margins"></h1></div></div></div>
+    </div>
+
+    <div class="row">
+        <div class="col-lg-6">
+            <div class="ibox float-e-margins">
+                <div class="ibox-title"><h5 langtag="word-configurationinformation"></h5><div class="ibox-tools"><a class="collapse-link"><i class="fa fa-chevron-up"></i></a><a class="close-link"><i class="fa fa-times"></i></a></div></div>
+                <div class="ibox-content no-padding"><ul id="config-list" class="list-group"></ul></div>
+            </div>
+        </div>
+        <div class="col-lg-6">
+            <div class="ibox float-e-margins">
+                <div class="ibox-title"><h5 langtag="word-systeminformation"></h5><div class="ibox-tools"><a class="collapse-link"><i class="fa fa-chevron-up"></i></a><a class="close-link"><i class="fa fa-times"></i></a></div></div>
+                <div class="ibox-content no-padding">
+                    <ul class="list-group">
+                        <li class="list-group-item"><div class="row"><div class="col-sm-6"><strong langtag="word-cpu"></strong></div><div class="col-sm-6 text-right"><strong id="overview_cpu"></strong></div></div><div class="progress progress-small"><div id="overview_cpu_bar" class="progress-bar"></div></div></li>
+                        <li class="list-group-item"><div class="row"><div class="col-sm-6"><strong langtag="word-memory"></strong></div><div class="col-sm-6 text-right"><strong id="overview_memory"></strong></div></div><div class="progress progress-small"><div id="overview_memory_bar" class="progress-bar"></div></div></li>
+                        <li class="list-group-item"><div class="row"><div class="col-sm-6"><strong langtag="word-load"></strong></div><div class="col-sm-6 text-right"><strong id="overview_load"></strong></div></div></li>
+                        <li class="list-group-item"><div class="row"><div class="col-sm-6"><strong langtag="word-tcpconnections_established"></strong></div><div class="col-sm-6 text-right"><strong id="overview_tcp"></strong></div></div></li>
+                        <li class="list-group-item"><div class="row"><div class="col-sm-6"><strong langtag="word-udpconnections_established"></strong></div><div class="col-sm-6 text-right"><strong id="overview_udp"></strong></div></div></li>
+                        <li class="list-group-item"><div class="row"><div class="col-sm-6"><strong langtag="word-outbandwidth"></strong></div><div class="col-sm-6 text-right"><strong id="overview_send"></strong></div></div></li>
+                        <li class="list-group-item"><div class="row"><div class="col-sm-6"><strong langtag="word-inbandwidth"></strong></div><div class="col-sm-6 text-right"><strong id="overview_recv"></strong></div></div></li>
+                    </ul>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="row">
+        <div class="col-lg-6"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-load"></h5></div><div class="ibox-content"><div id="load" style="height: 300px"></div></div></div></div>
+        <div class="col-lg-6"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-cpu"></h5></div><div class="ibox-content"><div id="cpu" style="height: 300px"></div></div></div></div>
+    </div>
+    <div class="row">
+        <div class="col-lg-6"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-memory"></h5></div><div class="ibox-content"><div id="memory" style="height: 300px"></div></div></div></div>
+        <div class="col-lg-6"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-connections_established"></h5></div><div class="ibox-content"><div id="connections" style="height: 300px"></div></div></div></div>
+    </div>
+    <div class="row">
+        <div class="col-lg-12"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-bandwidth"></h5></div><div class="ibox-content"><div id="bandwidth" style="height: 300px"></div></div></div></div>
+    </div>
+
+    <div class="row">
+        <div class="col-lg-6"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-trafficstatistics"></h5></div><div class="ibox-content"><div id="flow" style="height: 400px;"></div></div></div></div>
+        <div class="col-lg-6"><div class="ibox float-e-margins"><div class="ibox-title"><h5 langtag="word-type"></h5></div><div class="ibox-content"><div id="counts" style="height:400px;"></div></div></div></div>
+    </div>
+</div>
+
+<script>
+const data = JSON.parse($("<textarea/>").html("{{data}}").text());
+function formatMemoryValue(mb) {
+    if (mb >= 1024) {
+        return (mb / 1024).toFixed(2) + " GB";
+    }
+    return mb.toFixed(2) + " MB";
+}
+function memoryUsagePercent(usedMb, totalMb) {
+    if (!totalMb) {
+        return 0;
+    }
+    return Math.max(0, Math.min(100, usedMb / totalMb * 100));
+}
+function refreshMemoryOverview(usedMb, totalMb) {
+    const percent = memoryUsagePercent(usedMb, totalMb);
+    $("#overview_memory").text(formatMemoryValue(usedMb) + " / " + formatMemoryValue(totalMb));
+    $("#overview_memory_bar").width(percent + "%");
+}
+function refreshCommonOverview(data) {
+    $("#overview_cpu").text(data.cpu.toFixed(1) + "%");
+    $("#overview_cpu_bar").width(data.cpu + "%");
+    refreshMemoryOverview(data.virtual_mem, data.total_mem || 0);
+    $("#overview_load").empty();
+    JSON.parse(data.load).forEach(v => $("#overview_load").append('&emsp;' + v.toFixed(2)));
+    $("#overview_tcp").text(data.tcp);
+    $("#overview_udp").text(data.udp);
+    $("#overview_send").text(changeunit(data.io_send) + "/s");
+    $("#overview_recv").text(changeunit(data.io_recv) + "/s");
+}
+$("#bridge-port").text(data.bridgeType + ":" + data.httpProxyPort);
+$("#client-count").text(data.clientCount);
+$("#online-count").text(data.clientOnlineCount);
+$("#tcp-count").text(data.tcpCount);
+
+const conf_rows = [
+    ["word-bridgingmode", data.bridgeType],
+    ["word-httpport", data.httpProxyPort],
+    ["word-httpsport", data.httpsProxyPort],
+    ["word-iprestriction", "word-" + data.ipLimit],
+    ["word-trafficdatapersistence", data.flowStoreInterval],
+    ["word-loglevel", data.logLevel],
+    ["word-p2pport", data.p2pPort],
+    ["word-serveriP", data.serverIp],
+    ["word-serverversion", data.version]
+];
+conf_rows.forEach(function(row){
+    let val = row[1];
+    let tag = val.toString().startsWith("word-") ? ' langtag="'+val+'"' : "";
+    let final_val = tag ? "" : val;
+    $("#config-list").append('<li class="list-group-item"><div class="row"><div class="col-sm-6"><strong langtag="'+ row[0] +'"></strong></div><div class="col-sm-6 text-right"><strong'+tag+'>'+ final_val +'</strong></div></div></li>');
+});
+
+refreshCommonOverview(data);
+
+const sys_data = [];
+for(let i=1; i<=10; i++) sys_data.push(data["sys"+i]);
+const times = sys_data.map(s => s.time);
+
+chartdatas['load'] = {
+    tooltip: { trigger: 'axis' },
+    grid: { left: '3%', right: '3%', top: '5%', bottom: '3%', containLabel: true },
+    xAxis: { type: 'category', boundaryGap: false, data: times },
+    yAxis: { type: 'value' },
+    series: [
+        { name: '', type: 'line', smooth: true, data: sys_data.map(s => s.load1) },
+        { name: '', type: 'line', smooth: true, data: sys_data.map(s => s.load5) },
+        { name: '', type: 'line', smooth: true, data: sys_data.map(s => s.load15) }
+    ]
+};
+
+chartdatas['cpu'] = {
+    tooltip: { trigger: 'axis', formatter: '{b}<br/>{a}: {c}%' },
+    grid: { left: '3%', right: '3%', top: '5%', bottom: '3%', containLabel: true },
+    xAxis: { type: 'category', boundaryGap: false, data: times },
+    yAxis: { type: 'value', axisLabel: { formatter: '{value} %' } },
+    series: [{ name: '', type: 'line', smooth: true, data: sys_data.map(s => s.cpu) }]
+};
+
+chartdatas['memory'] = {
+    tooltip: { trigger: 'axis', formatter: '{b}<br/>{a}: {c}MB' },
+    grid: { left: '3%', right: '3%', top: '5%', bottom: '3%', containLabel: true },
+    xAxis: { type: 'category', boundaryGap: false, data: times },
+    yAxis: { type: 'value', axisLabel: { formatter: '{value} MB' } },
+    series: [
+        { name: '', type: 'line', smooth: true, data: sys_data.map(s => s.virtual_mem) },
+        { name: '', type: 'line', smooth: true, data: sys_data.map(s => s.swap_mem) }
+    ]
+};
+
+chartdatas['connections'] = {
+    tooltip: { trigger: 'axis' },
+    grid: { left: '3%', right: '3%', top: '5%', bottom: '3%', containLabel: true },
+    xAxis: { type: 'category', boundaryGap: false, data: times },
+    yAxis: { type: 'value' },
+    series: [
+        { name: '', type: 'line', smooth: true, data: sys_data.map(s => s.tcp) },
+        { name: '', type: 'line', smooth: true, data: sys_data.map(s => s.udp) }
+    ]
+};
+
+chartdatas['bandwidth'] = {
+    tooltip: { trigger: 'axis', formatter: function(p){ return p[0].axisValue + '<br/>' + p.map(x => x.seriesName + ': ' + changeunit(x.data) + '/s').join('<br/>'); } },
+    grid: { left: '3%', right: '3%', top: '5%', bottom: '3%', containLabel: true },
+    xAxis: { type: 'category', boundaryGap: false, data: times },
+    yAxis: { type: 'value', axisLabel: { formatter: function(v){ return changeunit(v); } } },
+    series: [
+        { name: '', type: 'line', smooth: true, data: sys_data.map(s => s.io_recv) },
+        { name: '', type: 'line', smooth: true, data: sys_data.map(s => s.io_send) }
+    ]
+};
+
+chartdatas['flow'] = {
+    tooltip: { trigger: 'item', formatter: function(p){ return p.seriesName + '<br/>' + p.name + ': ' + changeunit(p.data.value); } },
+    series: [{ name: '', type: 'pie', radius: '55%', center: ['50%', '60%'], data: [
+        { name: '', value: data.inletFlowCount },
+        { name: '', value: data.exportFlowCount }
+    ]}]
+};
+
+chartdatas["counts"] = {
+    tooltip: { trigger: "item" },
+    series: [{ type: "pie", radius: "55%", center: ["50%", "60%"], data: [
+        {name:"", value:data.hostCount}, {name:"", value:data.tcpC}, {name:"", value:data.udpCount},
+        {name:"", value:data.httpProxyCount}, {name:"", value:data.socks5Count},
+        {name:"", value:data.secretCount}, {name:"", value:data.p2pCount}
+    ]}]
+};
+
+setTimeout(function(){ $("body").setLang(""); }, 100);
+window.addEventListener('resize', () => { for(var key in charts) charts[key].resize(); });
+// Periodically refresh overview stats from server
+function refreshDashboard() {
+    $.getJSON(window.nps.web_base_url + '/api/dashboard', function(data) {
+        try {
+            refreshCommonOverview(data);
+        } catch (e) {
+            console.error('refreshDashboard error', e);
+        }
+    });
+}
+setInterval(refreshDashboard, 3000);
+</script>

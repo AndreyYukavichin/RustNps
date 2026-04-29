@@ -1,0 +1,11 @@
+<div class="wrapper wrapper-content animated fadeInRight">
+<div class="row"><div class="col-lg-8"><div class="ibox float-e-margins">
+<div class="ibox-title"><h5><span langtag="page-{{title_tag}}"></span></h5></div>
+<div class="ibox-content">
+<form id="editForm" onsubmit="submitform('edit','{{base}}{{action}}',$('#editForm').serializeArray()); return false;">
+{{id_input}}
+{{fields}}
+<button class="btn btn-primary" type="submit" langtag="word-save"></button>
+<a class="btn btn-white" href="javascript:history.back()" langtag="word-back"></a>
+</form>
+</div></div></div></div></div>

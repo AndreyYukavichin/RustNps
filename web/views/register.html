@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RustNps Register</title>
+    <link href="{{base}}/static/css/fontawesome.min.css" rel="stylesheet">
+    <link href="{{base}}/static/css/solid.min.css" rel="stylesheet">
+    <link href="{{base}}/static/css/bootstrap.min.css" rel="stylesheet">
+    <link href="{{base}}/static/css/style.css" rel="stylesheet">
+    <script src="{{base}}/static/js/jquery-3.4.1.min.js"></script>
+    <script src="{{base}}/static/js/bootstrap.min.js"></script>
+    <script src="{{base}}/static/js/language.js?v=202604292"></script>
+</head>
+<body class="gray-bg">
+<script>window.nps = {"web_base_url":"{{base}}"};</script>
+<div class="row border-bottom">
+    <nav class="navbar navbar-static-top navbar-right" role="navigation" style="margin: 20px 40px">
+        <h1 style="margin:0" class="navbar-header font-bold" langtag="application"></h1>
+        <span class="btn-group dropdown"><button id="languagemenu" class="btn btn-primary dropdown-toggle" type="button" data-toggle="dropdown"><i class="fa fa-globe-asia fa-lg"></i><span></span></button><ul class="dropdown-menu"></ul></span>
+    </nav>
+</div>
+<div class="middle-box text-center loginscreen animated fadeInDown">
+    <div><h1 class="logo-name" langtag="application"></h1></div>
+    <h3 langtag="info-register"></h3>
+    <form class="m-t" onsubmit="register(); return false">
+        <div class="form-group"><input type="text" class="form-control" placeholder="username" name="username" required langtag="word-username"></div>
+        <div class="form-group"><input type="password" class="form-control" placeholder="password" name="password" required langtag="word-password"></div>
+        <button onclick="register()" type="submit" class="btn btn-primary block full-width m-b" langtag="word-register"></button>
+        <a class="btn btn-sm btn-white btn-block" href="{{base}}/login/index" langtag="word-login"></a>
+    </form>
+</div>
+<script>
+function register() {
+    $.ajax({
+        type: "POST",
+        url: "{{base}}/login/register",
+        data: $("form").serializeArray(),
+        success: function (res) {
+            alert(res.msg);
+            if (res.status) window.location.href = "{{base}}/login/index";
+        }
+    });
+}
+</script>
+</body>
+</html>
