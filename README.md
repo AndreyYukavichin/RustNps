@@ -9,14 +9,14 @@
 - [ehang-io/nps](https://github.com/ehang-io/nps)
 - [yisier/nps](https://github.com/yisier/nps)
 
-RustNps 是对 Go 版 nps/npc 的 Rust 重构工程。当前工程保留 nps 的核心模型：一个公网服务端 `nps`、多个内网客户端 `npc`、服务端统一接收入站流量，再通过客户端主动建立的控制连接和数据连接把流量转发到内网目标。
+RustNps 是对 Go 版 nps/npc 的 Rust 重构工程。当前工程保留 nps 的核心模型：一个公网服务端 `rnps`、多个内网客户端 `rnpc`、服务端统一接收入站流量，再通过客户端主动建立的控制连接和数据连接把流量转发到内网目标。
 
 参考与致谢：
 **https://github.com/ehang-io/nps**
 **https://github.com/yisier/nps**
 
 
-> Design note: this Rust edition focuses on a safe, explicit control-plane + data-plane split. The wire protocol is RustNps native (`RNP1`) and is intended for RustNps `nps` and `npc` pairs, not for mixed Go/Rust runtime compatibility.
+> Design note: this Rust edition focuses on a safe, explicit control-plane + data-plane split. The wire protocol is RustNps native (`RNP1`) and is intended for RustNps `rnps` and `rnpc` pairs, not for mixed Go/Rust runtime compatibility.
 
 ## 功能覆盖
 
@@ -102,8 +102,8 @@ cargo build --release
 
 产物位置：
 
-- Windows: `target\release\nps.exe`, `target\release\npc.exe`
-- Linux: `target/release/nps`, `target/release/npc`
+- Windows: `target\release\rnps.exe`, `target\release\rnpc.exe`
+- Linux: `target/release/rnps`, `target/release/rnpc`
 
 交叉编译示例：
 
@@ -119,7 +119,7 @@ cargo build --release --target x86_64-unknown-linux-gnu
 可直接复用 Go 版 `conf/nps.conf` 的常用字段：
 
 ```bash
-./target/release/nps -conf_path=../nps/conf/nps.conf
+./target/release/rnps -conf_path=../nps/conf/nps.conf
 ```
 
 默认端口：
@@ -162,13 +162,13 @@ Bootstrap Table 数据接口保持 Go 版习惯，返回 `rows` 和 `total`：
 配置文件模式：
 
 ```bash
-./target/release/npc -config=../nps/conf/npc.conf
+./target/release/rnpc -config=../nps/conf/npc.conf
 ```
 
 无配置文件模式：
 
 ```bash
-./target/release/npc -server=SERVER_IP:8024 -vkey=123
+./target/release/rnpc -server=SERVER_IP:8024 -vkey=123
 ```
 
 客户端会先把 `npc.conf` 里的 hosts/tunnels 上报给服务端，然后保持一条控制连接。服务端收到外部访问时，会通过控制连接通知客户端新建数据连接，再由客户端拨内网目标。
@@ -317,7 +317,7 @@ WantedBy=multi-user.target
 Windows 可以使用 NSSM 或 PowerShell 注册服务：
 
 ```powershell
-New-Service -Name RustNps -BinaryPathName "C:\RustNps\nps.exe -conf_path=C:\RustNps\conf\nps.conf"
+New-Service -Name RustNps -BinaryPathName "C:\RustNps\rnps.exe -conf_path=C:\RustNps\conf\nps.conf"
 Start-Service RustNps
 ```
 
@@ -341,6 +341,6 @@ bridge_port=18024
 然后分别启动：
 
 ```bash
-./target/release/nps -conf_path=conf/nps.conf
-./target/release/npc -config=conf/npc.conf
+./target/release/rnps -conf_path=conf/nps.conf
+./target/release/rnpc -config=conf/npc.conf
 ```

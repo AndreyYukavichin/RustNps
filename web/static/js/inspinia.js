@@ -23,8 +23,8 @@ $(document).ready(function () {
     // MetisMenu
     //var sideMenu = $('#side-menu').metisMenu();
 
-    // Collapse ibox function
-    $('.collapse-link').on('click', function (e) {
+    // Collapse ibox function (delegated)
+    $(document).on('click', '.collapse-link', function (e) {
         e.preventDefault();
         var ibox = $(this).closest('div.ibox');
         var button = $(this).find('i');
@@ -33,20 +33,19 @@ $(document).ready(function () {
         button.toggleClass('fa-chevron-up').toggleClass('fa-chevron-down');
         ibox.toggleClass('').toggleClass('border-bottom');
         setTimeout(function () {
-            ibox.resize();
-            ibox.find('[id^=map-]').resize();
+            try { ibox.resize(); ibox.find('[id^=map-]').resize(); } catch (e) {}
         }, 50);
     });
 
-    // Close ibox function
-    $('.close-link').on('click', function (e) {
+    // Close ibox function (delegated)
+    $(document).on('click', '.close-link', function (e) {
         e.preventDefault();
         var content = $(this).closest('div.ibox');
         content.remove();
     });
 
-    // Fullscreen ibox function
-    $('.fullscreen-link').on('click', function (e) {
+    // Fullscreen ibox function (delegated)
+    $(document).on('click', '.fullscreen-link', function (e) {
         e.preventDefault();
         var ibox = $(this).closest('div.ibox');
         var button = $(this).find('i');
@@ -58,8 +57,8 @@ $(document).ready(function () {
         }, 100);
     });
 
-    // Close menu in canvas mode
-    $('.close-canvas-menu').on('click', function (e) {
+    // Close menu in canvas mode (delegated)
+    $(document).on('click', '.close-canvas-menu', function (e) {
         e.preventDefault();
         $("body").toggleClass("mini-navbar");
         SmoothlyMenu();
@@ -71,8 +70,8 @@ $(document).ready(function () {
     //    railOpacity: 0.9
     //});
 
-    // Open close right sidebar
-    $('.right-sidebar-toggle').on('click', function (e) {
+    // Open close right sidebar (delegated)
+    $(document).on('click', '.right-sidebar-toggle', function (e) {
         e.preventDefault();
         $('#right-sidebar').toggleClass('sidebar-open');
     });
@@ -84,8 +83,8 @@ $(document).ready(function () {
     //    wheelStep: 10
     //});
 
-    // Open close small chat
-    $('.open-small-chat').on('click', function (e) {
+    // Open close small chat (delegated)
+    $(document).on('click', '.open-small-chat', function (e) {
         e.preventDefault();
         $(this).children().toggleClass('fa-comments').toggleClass('fa-times');
         $('.small-chat-box').toggleClass('active');
@@ -97,8 +96,8 @@ $(document).ready(function () {
     //    railOpacity: 0.4
     //});
 
-    // Small todo handler
-    $('.check-link').on('click', function () {
+    // Small todo handler (delegated)
+    $(document).on('click', '.check-link', function () {
         var button = $(this).find('i');
         var label = $(this).next('span');
         button.toggleClass('fa-check-square').toggleClass('fa-square-o');
@@ -113,8 +112,8 @@ $(document).ready(function () {
     //       $('body').append(data);
     //});
 
-    // Minimalize menu
-    $('.navbar-minimalize').on('click', function (event) {
+    // Minimalize menu (delegated)
+    $(document).on('click', '.navbar-minimalize', function (event) {
         event.preventDefault();
         $("body").toggleClass("mini-navbar");
         SmoothlyMenu();

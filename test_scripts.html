@@ -1,0 +1,13 @@
+<html><body>
+<div id='content'></div>
+<script src='https://code.jquery.com/jquery-3.6.0.min.js'></script>
+<script>
+    var str = '<span>hi</span><script>console.log("EXECUTED");</script>';
+    var parser = new DOMParser();
+    var doc = parser.parseFromString('<div id="inner">' + str + '</div>', 'text/html');
+    var v = doc.querySelector('#inner');
+    $(document).ready(function() {
+        $('#content').html(v.innerHTML);
+    });
+</script>
+</body></html>

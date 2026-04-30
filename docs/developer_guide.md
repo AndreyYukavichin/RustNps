@@ -18,8 +18,8 @@
 快速开发流程
 -------------
 1. 构建：`cargo build` 或 `cargo build --release`。
-2. 运行服务端：`cargo run --bin nps -- -conf_path conf/nps.conf`。
-3. 运行客户端：`cargo run --bin npc -- -config conf/npc.conf`。
+2. 运行服务端：`cargo run --bin rnps -- -conf_path conf/nps.conf`。
+3. 运行客户端：`cargo run --bin rnpc -- -config conf/npc.conf`。
 4. 运行测试：`cargo test`（已通过若干单元测试）。
 
 添加新隧道类型（示例）

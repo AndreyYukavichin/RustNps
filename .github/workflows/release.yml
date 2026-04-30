@@ -16,6 +16,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   build-linux:
@@ -33,7 +34,7 @@ jobs:
             apt_package: gcc-arm-linux-gnueabihf
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -58,24 +59,24 @@ jobs:
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
           fi
-          SERVER_DIR="dist/RustNps-${TAG}-nps-${{ matrix.target }}"
-          CLIENT_DIR="dist/RustNps-${TAG}-npc-${{ matrix.target }}"
+          SERVER_DIR="dist/RustNps-${TAG}-rnps-${{ matrix.target }}"
+          CLIENT_DIR="dist/RustNps-${TAG}-rnpc-${{ matrix.target }}"
           mkdir -p "$SERVER_DIR/conf" "$CLIENT_DIR/conf"
-          cp "target/${{ matrix.target }}/release/nps" "$SERVER_DIR/"
-          cp "target/${{ matrix.target }}/release/npc" "$CLIENT_DIR/"
+          cp "target/${{ matrix.target }}/release/rnps" "$SERVER_DIR/"
+          cp "target/${{ matrix.target }}/release/rnpc" "$CLIENT_DIR/"
           cp conf/nps.conf "$SERVER_DIR/conf/"
           cp conf/npc.conf "$CLIENT_DIR/conf/"
           cp -r web "$SERVER_DIR/"
-          tar -C dist -czf "dist/RustNps-${TAG}-nps-${{ matrix.target }}.tar.gz" "RustNps-${TAG}-nps-${{ matrix.target }}"
-          tar -C dist -czf "dist/RustNps-${TAG}-npc-${{ matrix.target }}.tar.gz" "RustNps-${TAG}-npc-${{ matrix.target }}"
+          tar -C dist -czf "dist/RustNps-${TAG}-rnps-${{ matrix.target }}.tar.gz" "RustNps-${TAG}-rnps-${{ matrix.target }}"
+          tar -C dist -czf "dist/RustNps-${TAG}-rnpc-${{ matrix.target }}.tar.gz" "RustNps-${TAG}-rnpc-${{ matrix.target }}"
 
       - name: Upload packaged artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: linux-${{ matrix.target }}
           path: |
-            dist/RustNps-*-nps-${{ matrix.target }}.tar.gz
-            dist/RustNps-*-npc-${{ matrix.target }}.tar.gz
+            dist/RustNps-*-rnpc-${{ matrix.target }}.tar.gz
+            dist/RustNps-*-rnps-${{ matrix.target }}.tar.gz
 
   build-windows:
     name: Build Windows (${{ matrix.target }})
@@ -90,7 +91,7 @@ jobs:
             target: aarch64-pc-windows-msvc
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -107,25 +108,25 @@ jobs:
           if ($env:GITHUB_EVENT_NAME -eq 'workflow_dispatch') {
             $tag = '${{ inputs.tag }}'
           }
-          $serverDir = "dist/RustNps-$tag-nps-${{ matrix.target }}"
-          $clientDir = "dist/RustNps-$tag-npc-${{ matrix.target }}"
+          $serverDir = "dist/RustNps-$tag-rnps-${{ matrix.target }}"
+          $clientDir = "dist/RustNps-$tag-rnpc-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path "$serverDir/conf" | Out-Null
           New-Item -ItemType Directory -Force -Path "$clientDir/conf" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/nps.exe" $serverDir
-          Copy-Item "target/${{ matrix.target }}/release/npc.exe" $clientDir
+          Copy-Item "target/${{ matrix.target }}/release/rnps.exe" $serverDir
+          Copy-Item "target/${{ matrix.target }}/release/rnpc.exe" $clientDir
           Copy-Item "conf/nps.conf" "$serverDir/conf/"
           Copy-Item "conf/npc.conf" "$clientDir/conf/"
           Copy-Item "web" $serverDir -Recurse
-          Compress-Archive -Path $serverDir -DestinationPath "dist/RustNps-$tag-nps-${{ matrix.target }}.zip" -Force
-          Compress-Archive -Path $clientDir -DestinationPath "dist/RustNps-$tag-npc-${{ matrix.target }}.zip" -Force
+          Compress-Archive -Path $serverDir -DestinationPath "dist/RustNps-$tag-rnps-${{ matrix.target }}.zip" -Force
+          Compress-Archive -Path $clientDir -DestinationPath "dist/RustNps-$tag-rnpc-${{ matrix.target }}.zip" -Force
 
       - name: Upload packaged artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: windows-${{ matrix.target }}
           path: |
-            dist/RustNps-*-nps-${{ matrix.target }}.zip
-            dist/RustNps-*-npc-${{ matrix.target }}.zip
+            dist/RustNps-*-rnps-${{ matrix.target }}.zip
+            dist/RustNps-*-rnpc-${{ matrix.target }}.zip
 
   build-macos:
     name: Build macOS (${{ matrix.target }})
@@ -134,13 +135,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-13
+          - runner: macos-latest
             target: x86_64-apple-darwin
-          - runner: macos-14
+          - runner: macos-latest
             target: aarch64-apple-darwin
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -158,24 +159,24 @@ jobs:
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             TAG="${{ inputs.tag }}"
           fi
-          SERVER_DIR="dist/RustNps-${TAG}-nps-${{ matrix.target }}"
-          CLIENT_DIR="dist/RustNps-${TAG}-npc-${{ matrix.target }}"
+          SERVER_DIR="dist/RustNps-${TAG}-rnps-${{ matrix.target }}"
+          CLIENT_DIR="dist/RustNps-${TAG}-rnpc-${{ matrix.target }}"
           mkdir -p "$SERVER_DIR/conf" "$CLIENT_DIR/conf"
-          cp "target/${{ matrix.target }}/release/nps" "$SERVER_DIR/"
-          cp "target/${{ matrix.target }}/release/npc" "$CLIENT_DIR/"
+          cp "target/${{ matrix.target }}/release/rnps" "$SERVER_DIR/"
+          cp "target/${{ matrix.target }}/release/rnpc" "$CLIENT_DIR/"
           cp conf/nps.conf "$SERVER_DIR/conf/"
           cp conf/npc.conf "$CLIENT_DIR/conf/"
           cp -r web "$SERVER_DIR/"
-          tar -C dist -czf "dist/RustNps-${TAG}-nps-${{ matrix.target }}.tar.gz" "RustNps-${TAG}-nps-${{ matrix.target }}"
-          tar -C dist -czf "dist/RustNps-${TAG}-npc-${{ matrix.target }}.tar.gz" "RustNps-${TAG}-npc-${{ matrix.target }}"
+          tar -C dist -czf "dist/RustNps-${TAG}-rnps-${{ matrix.target }}.tar.gz" "RustNps-${TAG}-rnps-${{ matrix.target }}"
+          tar -C dist -czf "dist/RustNps-${TAG}-rnpc-${{ matrix.target }}.tar.gz" "RustNps-${TAG}-rnpc-${{ matrix.target }}"
 
       - name: Upload packaged artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: macos-${{ matrix.target }}
           path: |
-            dist/RustNps-*-nps-${{ matrix.target }}.tar.gz
-            dist/RustNps-*-npc-${{ matrix.target }}.tar.gz
+            dist/RustNps-*-rnps-${{ matrix.target }}.tar.gz
+            dist/RustNps-*-rnpc-${{ matrix.target }}.tar.gz
 
   release:
     name: Publish GitHub Release
@@ -186,10 +187,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all packaged artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: release-artifacts
 

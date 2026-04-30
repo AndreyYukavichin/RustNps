@@ -120,7 +120,7 @@ ip_limit=true
 
 ```bash
 # 向服务端登记当前来源 IP（示例）
-./target/release/npc register -server=SERVER_IP:18024 -vkey=123
+./target/release/rnpc register -server=SERVER_IP:18024 -vkey=123
 ```
 
 成功后，该来源 IP 会被服务端放行（通常带有时限）；如果启用了 Web 登录，登录成功的浏览器来源 IP 也会自动加入放行列表。
@@ -142,13 +142,13 @@ ip_limit=true
 
 ```bash
 cd RustNps
-cargo run --bin nps -- -conf_path conf/nps.conf
+cargo run --bin rnps -- -conf_path conf/nps.conf
 ```
 
 2. 在另一终端启动客户端（同机也可）：
 
 ```bash
-cargo run --bin npc -- -config conf/npc.conf
+cargo run --bin rnpc -- -config conf/npc.conf
 ```
 
 3. 打开 Web 管理页：`http://127.0.0.1:18081/`（默认端口可能不同，参照 `conf/nps.conf`）

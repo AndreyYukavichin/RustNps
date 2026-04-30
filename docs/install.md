@@ -4,7 +4,7 @@
 
 本章介绍在常见平台上构建与运行 `RustNps` 的步骤、常见注意事项以及示例服务运行方式。
 
-如果你只想快速试用：在 `RustNps` 目录执行 `cargo build --release`，然后运行 `target/release/nps -conf_path conf/nps.conf` 即可启动服务端。
+如果你只想快速试用：在 `RustNps` 目录执行 `cargo build --release`，然后运行 `target/release/rnps -conf_path conf/nps.conf` 即可启动服务端。
 
 ---
 
@@ -55,8 +55,8 @@ cargo build --release
 
 编译成功后可在 `target/release/` 下找到二进制：
 
-- Windows: `target\\release\\nps.exe`、`target\\release\\npc.exe`
-- Linux/macOS: `target/release/nps`、`target/release/npc`
+- Windows: `target\\release\\rnps.exe`、`target\\release\\rnpc.exe`
+- Linux/macOS: `target/release/rnps`、`target/release/rnpc`
 
 ---
 
@@ -66,24 +66,24 @@ cargo build --release
 
 ```bash
 # 启动服务端（使用仓库内示例配置）
-./target/release/nps -conf_path conf/nps.conf
+./target/release/rnps -conf_path conf/nps.conf
 
 # 启动客户端（同一台机器用于本地联调）
-./target/release/npc -config conf/npc.conf
+./target/release/rnpc -config conf/npc.conf
 ```
 
 - 使用 `cargo run`（用于开发调试）：
 
 ```bash
-cargo run --bin nps -- -conf_path conf/nps.conf
-cargo run --bin npc -- -config conf/npc.conf
+cargo run --bin rnps -- -conf_path conf/nps.conf
+cargo run --bin rnpc -- -config conf/npc.conf
 ```
 
 Windows PowerShell 示例：
 
 ```powershell
-.\target\\release\\nps.exe -conf_path conf\\nps.conf
-.\target\\release\\npc.exe -config conf\\npc.conf
+.\target\\release\\rnps.exe -conf_path conf\\nps.conf
+.\target\\release\\rnpc.exe -config conf\\npc.conf
 ```
 
 ---
@@ -102,7 +102,7 @@ cargo test    # 运行单元测试
 
 ## 运行在生产环境（建议）
 
-- 在 Linux 系统上可以使用 systemd 管理 `nps`：
+- 在 Linux 系统上可以使用 systemd 管理 `rnps`：
 
 示例 `nps.service`：
 
@@ -115,7 +115,7 @@ After=network.target
 Type=simple
 User=nps
 WorkingDirectory=/opt/RustNps
-ExecStart=/opt/RustNps/target/release/nps -conf_path /opt/RustNps/conf/nps.conf
+ExecStart=/opt/RustNps/target/release/rnps -conf_path /opt/RustNps/conf/nps.conf
 Restart=on-failure
 LimitNOFILE=65536
 

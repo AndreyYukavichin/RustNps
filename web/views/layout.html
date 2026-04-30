@@ -53,12 +53,69 @@
                 </ul>
             </nav>
         </div>
-        {{body}}
+        <div id="router-view">{{body}}</div>
         <div class="footer fixed">
             <div class="float-right"><img src="{{base}}/static/img/RustNps.png" alt="RustNps" style="height:24px; vertical-align:initial;" /></div>
             <div><strong langtag="word-copyright"></strong> <span langtag="application"></span> &copy; 2018-2020</div>
         </div>
     </div>
 </div>
+<script>
+$(document).ready(function() {
+    $(document).on('click', '#side-menu a', function(e) {
+        var $this = $(this);
+        var href = $this.attr('href');
+        
+        // Skip links that don't need SPA routing
+        if (!href || href === '#' || href.indexOf('/login') !== -1 || $this.closest('.nav-header').length) {
+            return;
+        }
+        
+        e.preventDefault();
+        
+        $('#side-menu li').removeClass('active');
+        $this.closest('li').addClass('active');
+
+        // Close collapse menu on mobile if open
+        if ($('body').hasClass('body-small')) {
+            $("body").toggleClass("mini-navbar");
+            SmoothlyMenu();
+        }
+
+        $.ajax({
+            url: href,
+            type: 'GET',
+            dataType: 'html',
+            success: function(html) {
+                var parser = new DOMParser();
+                var doc = parser.parseFromString(html, 'text/html');
+                var view = doc.querySelector('#router-view');
+                if (view) {
+                    $('#router-view').html(view.innerHTML);
+                    if (doc.title) {
+                        document.title = doc.title;
+                    }
+                    history.pushState({path: href}, '', href);
+                    // Refresh language tags
+                    if ($.fn.setLang) {
+                        $().setLang('');
+                    }
+                } else {
+                    location.href = href;
+                }
+            },
+            error: function() {
+                location.href = href;
+            }
+        });
+    });
+
+    window.addEventListener('popstate', function(e) {
+        if (e.state && e.state.path) {
+            location.reload();
+        }
+    });
+});
+</script>
 </body>
 </html>

@@ -5,13 +5,13 @@
 使用配置文件启动：
 
 ```bash
-./target/release/nps -conf_path=conf/nps.conf
+./target/release/rnps -conf_path=conf/nps.conf
 ```
 
 Windows：
 
 ```powershell
-.\target\release\nps.exe -conf_path=conf\nps.conf
+.\target\release\rnps.exe -conf_path=conf\nps.conf
 ```
 
 默认关键端口：
@@ -26,26 +26,26 @@ Windows：
 配置文件模式：
 
 ```bash
-./target/release/npc -config=conf/npc.conf
+./target/release/rnpc -config=conf/npc.conf
 ```
 
 Windows：
 
 ```powershell
-.\target\release\npc.exe -config=conf\npc.conf
+.\target\release\rnpc.exe -config=conf\npc.conf
 ```
 
 无配置文件模式：
 
 ```bash
-./target/release/npc -server=SERVER_IP:8024 -vkey=123
+./target/release/rnpc -server=SERVER_IP:8024 -vkey=123
 ```
 
 ## 启动顺序建议
 
-1. 先启动 `nps`
+1. 先启动 `rnps`
 2. 确认 `bridge_port` / `web_port` 已监听
-3. 再启动 `npc`
+3. 再启动 `rnpc`
 4. 访问 Web 管理页面检查客户端是否在线
 
 ## Web 管理
@@ -77,8 +77,8 @@ web_password=123
 推荐顺序：
 
 1. 启动本地 backend：`powershell -ExecutionPolicy Bypass -File .\test-e2e\start-backend.ps1`
-2. 启动服务端：`.\target\debug\nps.exe -conf_path .\test-e2e\nps-e2e.conf`
-3. 按需启动客户端：`.\target\debug\npc.exe -config .\test-e2e\npc-raw-rate.conf` 等
+2. 启动服务端：`.\target\debug\rnps.exe -conf_path .\test-e2e\nps-e2e.conf`
+3. 按需启动客户端：`.\target\debug\rnpc.exe -config .\test-e2e\npc-raw-rate.conf` 等
 
 这套联调默认使用本地 backend `127.0.0.1:28081`，对应脚本和配置已经统一到同一端口，避免旧的 `28080` 残留监听误导结果。
 

@@ -2333,7 +2333,7 @@ pub fn login_captcha_block(registry: &Registry) -> String {
     };
     let base = &registry.server.web_base_url;
     format!(
-        r#"<div class="form-group"><div class="d-flex align-items-center mb-2"><img src="{base}/captcha/?token={token}" alt="captcha" style="height:40px; border:1px solid #ddd; border-radius:4px; background:#fff;" /><a class="btn btn-sm btn-white ml-2" href="{base}/login/index" title="refresh captcha">↻</a></div><input type="hidden" name="captcha_token" value="{token}"><input class="form-control" name="captcha" placeholder="captcha" required langtag="word-captcha"></div>"#
+        r#"<div class="form-group" style="display:flex;"><input type="hidden" name="captcha_token" value="{token}"><input class="form-control" name="captcha" placeholder="captcha" required langtag="word-captcha" style="border-top-right-radius:0;border-bottom-right-radius:0;border-right:0;"><img src="{base}/captcha/?token={token}" onclick="fetch(location.href).then(r=>r.text()).then(h=>{{let m=h.match(/name=\x22captcha_token\x22 value=\x22([^\x22]+)\x22/);if(m){{let p=this.previousElementSibling;p.value='';p.previousElementSibling.value=m[1];this.src='{base}/captcha/?token='+m[1]}}}})" alt="captcha" style="height:34px; cursor:pointer; border:1px solid #e5e6e7; border-radius:0 4px 4px 0; background:#fff;" title="refresh captcha" /></div>"#
     )
 }
 
