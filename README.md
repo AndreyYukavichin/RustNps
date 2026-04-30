@@ -1,5 +1,14 @@
 # RustNps
 
+<p align="center">
+  <img src="web/static/img/RustNps.png" alt="RustNps Logo" height="150" />
+</p>
+
+**致敬与鸣谢：**
+本项目参考并部分基于以下优秀的开源项目，特此致敬：
+- [ehang-io/nps](https://github.com/ehang-io/nps)
+- [yisier/nps](https://github.com/yisier/nps)
+
 RustNps 是对 Go 版 nps/npc 的 Rust 重构工程。当前工程保留 nps 的核心模型：一个公网服务端 `nps`、多个内网客户端 `npc`、服务端统一接收入站流量，再通过客户端主动建立的控制连接和数据连接把流量转发到内网目标。
 
 > Design note: this Rust edition focuses on a safe, explicit control-plane + data-plane split. The wire protocol is RustNps native (`RNP1`) and is intended for RustNps `nps` and `npc` pairs, not for mixed Go/Rust runtime compatibility.
