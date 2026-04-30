@@ -94,6 +94,12 @@ pub struct WebSession {
     pub username: String,
 }
 
+#[derive(Debug, Clone)]
+struct CaptchaEntry {
+    code: String,
+    expires_at: SystemTime,
+}
+
 impl WebSession {
     pub fn admin(username: impl Into<String>) -> Self {
         Self {
@@ -123,6 +129,7 @@ pub struct Registry {
     pub cursors: Mutex<HashMap<String, usize>>,
     pub sessions: Mutex<HashMap<String, WebSession>>,
     pub global: Mutex<GlobalConfig>,
+    captcha_store: Mutex<HashMap<String, CaptchaEntry>>,
     http_cache: Mutex<HttpResponseCache>,
     active_conn_counts: Mutex<HashMap<String, usize>>,
     authorized_ips: Mutex<HashMap<String, SystemTime>>,
@@ -145,6 +152,7 @@ impl Registry {
             cursors: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             global: Mutex::new(GlobalConfig::default()),
+            captcha_store: Mutex::new(HashMap::new()),
             http_cache: Mutex::new(HttpResponseCache::default()),
             active_conn_counts: Mutex::new(HashMap::new()),
             authorized_ips: Mutex::new(HashMap::new()),
@@ -223,6 +231,11 @@ pub fn entry() -> io::Result<()> {
             "log_path is configured as {}, console output remains enabled in RustNps",
             config.log_path
         );
+    }
+    if std::env::var("NPS_WEB_PATH").is_err() {
+        if let Some(web_root) = resolve_web_root_from_conf_path(Path::new(&conf_path)) {
+            std::env::set_var("NPS_WEB_PATH", web_root);
+        }
     }
     run_with_store(config, PersistentStore::from_conf_path(&conf_path))
 }
@@ -1509,6 +1522,58 @@ fn validate_tunnel_ports(server: &ServerConfig, tunnel: &Tunnel) -> io::Result<(
     Ok(())
 }
 
+fn ensure_tunnel_server_port(server: &ServerConfig, tunnel: &mut Tunnel) -> io::Result<()> {
+    if tunnel.server_port == 0 {
+        tunnel.server_port = generate_server_port(server, &tunnel.mode, &tunnel.server_ip)?;
+        tunnel.ports = tunnel.server_port.to_string();
+    } else if tunnel.ports.trim().is_empty() {
+        tunnel.ports = tunnel.server_port.to_string();
+    }
+    Ok(())
+}
+
+fn generate_server_port(server: &ServerConfig, mode: &str, server_ip: &str) -> io::Result<u16> {
+    let bind_ip = if server_ip.trim().is_empty() {
+        "0.0.0.0"
+    } else {
+        server_ip
+    };
+    let mode_lc = mode.to_ascii_lowercase();
+
+    if !server.allow_ports.trim().is_empty() {
+        for port in expand_ports(&server.allow_ports) {
+            if port == 0 {
+                continue;
+            }
+            let available = if mode_lc == "udp" {
+                UdpSocket::bind((bind_ip, port)).is_ok()
+            } else {
+                TcpListener::bind((bind_ip, port)).is_ok()
+            };
+            if available {
+                return Ok(port);
+            }
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "no available server port found in allow_ports",
+        ));
+    }
+
+    let port = if mode_lc == "udp" {
+        UdpSocket::bind((bind_ip, 0))?.local_addr()?.port()
+    } else {
+        TcpListener::bind((bind_ip, 0))?.local_addr()?.port()
+    };
+    if port < 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "generated server port is invalid",
+        ));
+    }
+    Ok(port)
+}
+
 fn port_allowed(allow_ports: &str, port: u16) -> bool {
     allow_ports
         .split(',')
@@ -2259,6 +2324,89 @@ pub fn authenticate_web_user(
     })
 }
 
+pub fn login_captcha_block(registry: &Registry) -> String {
+    if !registry.server.open_captcha {
+        return String::new();
+    }
+    let Some(token) = issue_login_captcha(registry) else {
+        return String::new();
+    };
+    let base = &registry.server.web_base_url;
+    format!(
+        r#"<div class="form-group"><div class="d-flex align-items-center mb-2"><img src="{base}/captcha/?token={token}" alt="captcha" style="height:40px; border:1px solid #ddd; border-radius:4px; background:#fff;" /><a class="btn btn-sm btn-white ml-2" href="{base}/login/index" title="refresh captcha">↻</a></div><input type="hidden" name="captcha_token" value="{token}"><input class="form-control" name="captcha" placeholder="captcha" required langtag="word-captcha"></div>"#
+    )
+}
+
+pub fn captcha_svg(registry: &Registry, token: &str) -> Option<String> {
+    let now = SystemTime::now();
+    let mut store = registry.captcha_store.lock().unwrap();
+    let (code, expires_at) = store.get(token).map(|entry| (entry.code.clone(), entry.expires_at))?;
+    if expires_at <= now {
+        store.remove(token);
+        return None;
+    }
+    Some(render_captcha_svg(&code))
+}
+
+pub fn verify_login_captcha(registry: &Registry, token: &str, answer: &str) -> bool {
+    if !registry.server.open_captcha {
+        return true;
+    }
+    let token = token.trim();
+    let answer = answer.trim();
+    if token.is_empty() || answer.is_empty() {
+        return false;
+    }
+    let mut store = registry.captcha_store.lock().unwrap();
+    let Some(entry) = store.remove(token) else {
+        return false;
+    };
+    if entry.expires_at <= SystemTime::now() {
+        return false;
+    }
+    entry.code.eq_ignore_ascii_case(answer)
+}
+
+fn issue_login_captcha(registry: &Registry) -> Option<String> {
+    let token = md5_hex(&format!("{:?}:{}", SystemTime::now(), registry.next_link_id()));
+    let code = captcha_code_from_token(&token);
+    let expires_at = SystemTime::now()
+        .checked_add(Duration::from_secs(300))
+        .unwrap_or(SystemTime::now());
+    registry.captcha_store.lock().unwrap().insert(
+        token.clone(),
+        CaptchaEntry { code, expires_at },
+    );
+    Some(token)
+}
+
+fn captcha_code_from_token(token: &str) -> String {
+    let digest = md5_hex(token).to_uppercase();
+    digest.chars().take(5).collect()
+}
+
+fn render_captcha_svg(code: &str) -> String {
+    let digest = md5_hex(code);
+    let mut seeded = digest.bytes();
+    let width = 140;
+    let height = 44;
+    let mut noise = String::new();
+    for _ in 0..5 {
+        let x1 = next_seed(&mut seeded) % width;
+        let y1 = next_seed(&mut seeded) % height;
+        let x2 = next_seed(&mut seeded) % width;
+        let y2 = next_seed(&mut seeded) % height;
+        noise.push_str(&format!(r##"<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#c8c8c8" stroke-width="1" />"##));
+    }
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}"><rect x="0" y="0" width="{width}" height="{height}" rx="4" fill="#f8fafc" stroke="#d6d8de"/>{noise}<text x="50%" y="58%" dominant-baseline="middle" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#1f2937" letter-spacing="4">{code}</text></svg>"##
+    )
+}
+
+fn next_seed(seed: &mut impl Iterator<Item = u8>) -> u32 {
+    seed.next().unwrap_or(0) as u32
+}
+
 pub fn authorize_web_login_ip(registry: &Registry, remote: &str) {
     authorize_ip(registry, remote, 2);
 }
@@ -2827,6 +2975,9 @@ pub fn mutate_tunnel_copy(registry: &Arc<Registry>, params: &HashMap<String, Str
                 clone.id = registry.next_link_id();
                 clone.server_port = 0;
                 clone.ports.clear();
+                if let Err(err) = ensure_tunnel_server_port(&registry.server, &mut clone) {
+                    return ajax(0, &err.to_string());
+                }
                 clone.status = false;
                 clone.run_status = false;
                 clone.no_store = false;
@@ -2872,6 +3023,9 @@ pub fn mutate_tunnel_add(registry: &Arc<Registry>, params: &HashMap<String, Stri
     tunnel.status = true;
     tunnel.run_status = true;
     tunnel.no_store = false;
+    if let Err(err) = ensure_tunnel_server_port(&registry.server, &mut tunnel) {
+        return ajax(0, &err.to_string());
+    }
     if let Err(err) = validate_tunnel_ports(&registry.server, &tunnel) {
         return ajax(0, &err.to_string());
     }
@@ -2913,10 +3067,10 @@ pub fn mutate_tunnel_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
         for config in clients.values_mut() {
             if let Some(tunnel) = config.tunnels.iter_mut().find(|t| t.id == id) {
                 let ports = param_any(params, &["ports", "port"]);
-                if !ports.is_empty() {
+                let requested_port = expand_ports(&ports).into_iter().next().unwrap_or(0);
+                if requested_port != tunnel.server_port {
                     tunnel.ports = ports;
-                    tunnel.server_port =
-                        expand_ports(&tunnel.ports).into_iter().next().unwrap_or(0);
+                    tunnel.server_port = requested_port;
                 }
                 let server_ip = param_any(params, &["server_ip", "serverIp"]);
                 if !server_ip.is_empty() {
@@ -2934,6 +3088,9 @@ pub fn mutate_tunnel_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
                 tunnel.strip_pre = param(params, "strip_pre");
                 tunnel.proto_version = param_any(params, &["proto_version", "proxy_protocol"]);
                 tunnel.no_store = false;
+                if let Err(err) = ensure_tunnel_server_port(&registry.server, tunnel) {
+                    return ajax(0, &err.to_string());
+                }
                 if let Err(err) = validate_tunnel_ports(&registry.server, tunnel) {
                     return ajax(0, &err.to_string());
                 }
@@ -3474,4 +3631,20 @@ fn default_server_conf() -> String {
         }
     }
     "conf/nps.conf".to_string()
+}
+
+fn resolve_web_root_from_conf_path(conf_path: &Path) -> Option<std::path::PathBuf> {
+    let absolute_conf = if conf_path.is_absolute() {
+        conf_path.to_path_buf()
+    } else {
+        env::current_dir().ok()?.join(conf_path)
+    };
+
+    for ancestor in absolute_conf.ancestors() {
+        let candidate = ancestor.join("web");
+        if candidate.is_dir() && candidate.join("views").is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
 }

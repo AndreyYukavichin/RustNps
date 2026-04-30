@@ -38,8 +38,10 @@ RustNps 是对 Go 版 nps/npc 的 Rust 重构工程。当前工程保留 nps 的
 | secret 模式 | `SecretVisitor` relay | 已实现 |
 | p2p 模式 | `P2pVisitor` relay fallback | 已实现中继兜底 |
 | Web 管理页 | `start_web_manager` | 已实现轻量 Dashboard/API |
+| 管理面板登录验证码 | `open_captcha`, `/captcha/`, `login_captcha_block` | 已实现，开启后登录需验证验证码 |
 | Go 版 Web 静态资源 | `web/static` | 已迁移 Bootstrap、FontAwesome、ECharts、语言包、图片等 |
 | Go 版 Web 操作体验 | `src/server.rs` Web 兼容层 | 已实现登录、侧栏、Dashboard、客户端/隧道/域名列表和主要操作按钮 |
+| 新增/复制/编辑隧道自动分配端口 | `ensure_tunnel_server_port`, `generate_server_port` | 已实现，端口为空或 0 时自动回填可用端口 |
 | 端口范围映射 | `expand_ports`, `expand_runtime_tunnels` | 已实现 |
 | 环境变量渲染 | `{{.ENV_NAME}}` | 已实现 |
 | bridge mux 连接复用 | `src/mux.rs`, `src/client.rs`, `src/server.rs` | 已实现 |
@@ -47,6 +49,19 @@ RustNps 是对 Go 版 nps/npc 的 Rust 重构工程。当前工程保留 nps 的
 | `allow_rate_limit` / `allow_flow_limit` | `src/relay.rs`, `src/server.rs` | 已实现运行时限速和流量封顶 |
 | `ip_limit` 注册与登录联动 | `src/server.rs`, `src/web.rs` | 已实现 |
 | `max_conn` / `max_tunnel_num` / `allow_ports` | `src/server.rs` | 已实现 |
+
+### 当前对齐说明
+
+下面这些 Go 版 nps 的近期能力，RustNps 目前已经补齐或保持兼容：
+
+- 管理面板登录验证码：配置 `open_captcha=true` 后，登录页会显示验证码并在登录时校验。
+- 隧道自动生成服务端口：新增、复制、编辑隧道时，如果端口为空或 0，会自动生成一个可用端口并写回任务。
+- API 返回 ID：新增客户端、主机、隧道时会返回对应的 `id`，方便前端或脚本继续操作。
+- 唯一验证密钥显示：域名解析页和隧道列表页已保留 `VerifyKey` / `VKey` 的展示与查询。
+- 客户端黑名单 IP：新增或编辑客户端时可配置多个黑名单 IP。
+- `ip_limit` 注册与登录联动：已保留注册授权 IP 逻辑，管理面板登录也会授权当前 IP。
+
+这部分功能已经可以按 Go 版的常见使用方式继续迁移；如果你在 Go 版里主要依赖的是上面这些能力，RustNps 现在已经覆盖了大部分日常管理路径。
 
 暂未完全等价 Go 版的高级实现：
 

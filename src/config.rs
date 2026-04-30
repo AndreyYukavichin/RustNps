@@ -31,6 +31,7 @@ pub fn load_server_config(path: impl AsRef<Path>) -> io::Result<ServerConfig> {
     c.web_base_url = get_string(&kv, "web_base_url", &c.web_base_url);
     c.allow_user_login = get_bool(&kv, "allow_user_login", c.allow_user_login);
     c.allow_user_register = get_bool(&kv, "allow_user_register", c.allow_user_register);
+    c.open_captcha = get_bool(&kv, "open_captcha", c.open_captcha);
     c.allow_user_change_username = get_bool(
         &kv,
         "allow_user_change_username",

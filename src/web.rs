@@ -34,6 +34,7 @@ pub async fn start_web_manager(
         .route("/login/index", get(handle_login))
         .route("/login/", get(handle_login))
         .route("/login/verify", post(handle_login_verify))
+        .route("/captcha/", get(handle_captcha))
         .route(
             "/login/register",
             get(handle_register).post(handle_register_submit),
@@ -136,6 +137,18 @@ async fn handle_login(State(registry): State<Arc<Registry>>) -> Html<String> {
     Html(render_login(&registry, ""))
 }
 
+async fn handle_captcha(
+    State(registry): State<Arc<Registry>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let token = params.get("token").cloned().unwrap_or_default();
+    if let Some(svg) = server::captcha_svg(registry.as_ref(), &token) {
+        ([("content-type", "image/svg+xml; charset=utf-8")], svg).into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 async fn handle_register(State(registry): State<Arc<Registry>>) -> Html<String> {
     if !registry.server.allow_user_register {
         return Html(render_login(&registry, "register is not allow"));
@@ -162,6 +175,20 @@ async fn handle_login_verify(
 ) -> impl IntoResponse {
     let username = params.get("username").cloned().unwrap_or_default();
     let password = params.get("password").cloned().unwrap_or_default();
+
+    if registry.server.open_captcha {
+        let captcha_token = params.get("captcha_token").cloned().unwrap_or_default();
+        let captcha = params.get("captcha").cloned().unwrap_or_default();
+        if !server::verify_login_captcha(registry.as_ref(), &captcha_token, &captcha) {
+            return (
+                jar,
+                axum::Json(serde_json::json!({
+                    "status": 0,
+                    "msg": "the verification code is wrong, please get it again and try again"
+                })),
+            );
+        }
+    }
 
     if let Some(session) = server::authenticate_web_user(&registry, &username, &password) {
         server::authorize_web_login_ip(registry.as_ref(), &remote_addr.to_string());
@@ -1046,12 +1073,14 @@ fn render_login(r: &Registry, message: &str) -> String {
     } else {
         String::new()
     };
+    let captcha_block = server::login_captcha_block(r);
     load_view(
         "login.html",
         &HashMap::from([
             ("base".to_string(), r.server.web_base_url.clone()),
             ("message".to_string(), message.to_string()),
             ("register_link".to_string(), register_link),
+            ("captcha_block".to_string(), captcha_block),
         ]),
     )
 }
