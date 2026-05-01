@@ -11,12 +11,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build static musl binaries (docker)
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl build tools
         run: |
-          docker run --rm -v "${GITHUB_WORKSPACE}":/home/rust/src ekidd/rust-musl-builder:latest /bin/bash -lc "\
-            cargo build --release --bin rnps --target x86_64-unknown-linux-musl && \
-            cargo build --release --bin rnpc --target x86_64-unknown-linux-musl\
-          "
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build static musl binaries
+        env:
+          CARGO_TERM_COLOR: always
+        run: |
+          cargo build --locked --release --bin rnps --target x86_64-unknown-linux-musl
+          cargo build --locked --release --bin rnpc --target x86_64-unknown-linux-musl
+
+      - name: Verify binaries are static
+        run: |
+          file target/x86_64-unknown-linux-musl/release/rnps
+          file target/x86_64-unknown-linux-musl/release/rnpc
+          ldd target/x86_64-unknown-linux-musl/release/rnps || true
+          ldd target/x86_64-unknown-linux-musl/release/rnpc || true
 
       - name: Package artifacts
         run: |
