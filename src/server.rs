@@ -25,7 +25,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -122,6 +122,7 @@ pub struct Registry {
     pub server: ServerConfig,
     pub controls: Mutex<HashMap<String, ControlHandle>>,
     pub mux_sessions: Mutex<HashMap<String, Arc<MuxSession>>>,
+    listener_shutdowns: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     pub pending: Mutex<HashMap<u64, Sender<Box<dyn RelayStream>>>>,
     pub clients: Mutex<HashMap<String, ClientRuntimeConfig>>,
     pub secrets: Mutex<HashMap<String, Tunnel>>,
@@ -145,6 +146,7 @@ impl Registry {
             server,
             controls: Mutex::new(HashMap::new()),
             mux_sessions: Mutex::new(HashMap::new()),
+            listener_shutdowns: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             secrets: Mutex::new(HashMap::new()),
@@ -485,6 +487,10 @@ fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Res
             version,
             core_version,
         } => {
+            if let Err(err) = validate_client_handshake(&registry, &vkey, &remote_addr, false) {
+                write_message(&mut stream, &error(err.to_string()))?;
+                return Ok(());
+            }
             crate::log_info!(
                 "nps",
                 "client {vkey} connection succeeded, address:{remote_addr}, version={version}, core={core_version}"
@@ -516,6 +522,10 @@ fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Res
             version,
             core_version,
         } => {
+            if let Err(err) = validate_client_handshake(&registry, &vkey, &remote_addr, false) {
+                write_message(&mut stream, &error(err.to_string()))?;
+                return Ok(());
+            }
             crate::log_info!(
                 "nps",
                 "client mux from {vkey}, address:{remote_addr}, version={version}, core={core_version}"
@@ -563,6 +573,10 @@ fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Res
             core_version,
             mut config,
         } => {
+            if let Err(err) = validate_client_handshake(&registry, &vkey, &remote_addr, true) {
+                write_message(&mut stream, &error(err.to_string()))?;
+                return Ok(());
+            }
             crate::log_info!(
                 "nps",
                 "client config from {vkey}, address:{remote_addr}, version={version}, core={core_version}"
@@ -742,15 +756,22 @@ fn start_tunnel_task(registry: Arc<Registry>, tunnel: Tunnel) {
             return;
         }
     }
+    let shutdown = Arc::new(AtomicBool::new(false));
+    registry
+        .listener_shutdowns
+        .lock()
+        .unwrap()
+        .insert(tunnel.id, Arc::clone(&shutdown));
 
     thread::spawn(move || {
         let remark = tunnel.remark.clone();
+        let tunnel_id = tunnel.id;
         let registry_for_cleanup = Arc::clone(&registry);
         let result = match mode.as_str() {
-            "tcp" | "tcptrans" | "file" => start_tcp_listener(registry, tunnel),
-            "httpproxy" => start_http_proxy_listener(registry, tunnel),
-            "socks5" => start_socks5_listener(registry, tunnel),
-            "udp" => start_udp_listener(registry, tunnel),
+            "tcp" | "tcptrans" | "file" => start_tcp_listener(registry, tunnel, shutdown),
+            "httpproxy" => start_http_proxy_listener(registry, tunnel, shutdown),
+            "socks5" => start_socks5_listener(registry, tunnel, shutdown),
+            "udp" => start_udp_listener(registry, tunnel, shutdown),
             other => {
                 crate::log_error!(
                     "nps",
@@ -768,7 +789,81 @@ fn start_tunnel_task(registry: Arc<Registry>, tunnel: Tunnel) {
             .lock()
             .unwrap()
             .remove(&listener_key);
+        registry_for_cleanup
+            .listener_shutdowns
+            .lock()
+            .unwrap()
+            .remove(&tunnel_id);
     });
+}
+
+fn start_active_tunnels_for_client(registry: &Arc<Registry>, config: &ClientRuntimeConfig) {
+    if !config.common.client.status {
+        return;
+    }
+    for tunnel in &config.tunnels {
+        if tunnel.status && tunnel.run_status {
+            start_tunnel_task(Arc::clone(registry), tunnel.clone());
+        }
+    }
+}
+
+fn stop_tunnel_runtime(registry: &Arc<Registry>, tunnel: &Tunnel) {
+    if let Some(flag) = registry
+        .listener_shutdowns
+        .lock()
+        .unwrap()
+        .remove(&tunnel.id)
+    {
+        flag.store(true, Ordering::SeqCst);
+    }
+    if let Some(key) = listener_key(tunnel) {
+        for _ in 0..20 {
+            if !registry.listeners.lock().unwrap().contains(&key) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+fn stop_tunnel_runtimes(registry: &Arc<Registry>, tunnels: &[Tunnel]) {
+    for tunnel in tunnels {
+        stop_tunnel_runtime(registry, tunnel);
+    }
+}
+
+fn terminate_client_connection(registry: &Arc<Registry>, vkey: &str, reason: &str) {
+    let handle = registry.controls.lock().unwrap().remove(vkey);
+    registry.mux_sessions.lock().unwrap().remove(vkey);
+    registry.active_conn_counts.lock().unwrap().remove(vkey);
+    if let Some(handle) = handle {
+        let _ = handle.tx.send(ServerMessage::Stop {
+            reason: reason.to_string(),
+        });
+    }
+}
+
+fn rebuild_secret_registry(registry: &Arc<Registry>) {
+    let mut next = HashMap::new();
+    let clients = registry.clients.lock().unwrap();
+    for client in clients.values() {
+        if !client.common.client.status {
+            continue;
+        }
+        for tunnel in &client.tunnels {
+            let mode = tunnel.mode.to_ascii_lowercase();
+            if !(mode == "secret" || mode == "p2p") || !tunnel.status || !tunnel.run_status {
+                continue;
+            }
+            if tunnel.password.is_empty() {
+                continue;
+            }
+            next.insert(tunnel.password.clone(), tunnel.clone());
+            next.insert(md5_hex(&tunnel.password), tunnel.clone());
+        }
+    }
+    *registry.secrets.lock().unwrap() = next;
 }
 
 fn listener_key(tunnel: &Tunnel) -> Option<String> {
@@ -783,9 +878,14 @@ fn listener_key(tunnel: &Tunnel) -> Option<String> {
     ))
 }
 
-fn start_tcp_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<()> {
+fn start_tcp_listener(
+    registry: Arc<Registry>,
+    tunnel: Tunnel,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<()> {
     let addr = bind_addr(&tunnel);
     let listener = TcpListener::bind(&addr)?;
+    listener.set_nonblocking(true)?;
     crate::log_info!(
         "nps",
         "tunnel task {} start mode:{} port {}",
@@ -801,9 +901,16 @@ fn start_tcp_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<()>
     );
     let cursor_key = format!("{}:{}", tunnel.client_vkey, tunnel.remark);
 
-    for incoming in listener.incoming() {
-        let mut inbound = match incoming {
-            Ok(s) => s,
+    loop {
+        if shutdown.load(Ordering::SeqCst) || !tunnel_is_active(&registry, tunnel.id) {
+            break;
+        }
+        let mut inbound = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(err) => {
                 crate::log_warn!("nps", "client connection accept failed on {addr}: {err}");
                 continue;
@@ -867,9 +974,14 @@ fn start_tcp_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<()>
     Ok(())
 }
 
-fn start_http_proxy_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<()> {
+fn start_http_proxy_listener(
+    registry: Arc<Registry>,
+    tunnel: Tunnel,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<()> {
     let addr = bind_addr(&tunnel);
     let listener = TcpListener::bind(&addr)?;
+    listener.set_nonblocking(true)?;
     crate::log_info!(
         "nps",
         "tunnel task {} start mode:httpProxy port {}",
@@ -877,9 +989,16 @@ fn start_http_proxy_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Res
         tunnel.server_port
     );
     crate::log_debug!("nps", "http proxy {} listening on {addr}", tunnel.remark);
-    for incoming in listener.incoming() {
-        let mut inbound = match incoming {
-            Ok(s) => s,
+    loop {
+        if shutdown.load(Ordering::SeqCst) || !tunnel_is_active(&registry, tunnel.id) {
+            break;
+        }
+        let mut inbound = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(err) => {
                 crate::log_warn!("nps", "http proxy accept failed: {err}");
                 continue;
@@ -939,9 +1058,14 @@ fn start_http_proxy_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Res
     Ok(())
 }
 
-fn start_socks5_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<()> {
+fn start_socks5_listener(
+    registry: Arc<Registry>,
+    tunnel: Tunnel,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<()> {
     let addr = bind_addr(&tunnel);
     let listener = TcpListener::bind(&addr)?;
+    listener.set_nonblocking(true)?;
     crate::log_info!(
         "nps",
         "tunnel task {} start mode:socks5 port {}",
@@ -949,9 +1073,16 @@ fn start_socks5_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<
         tunnel.server_port
     );
     crate::log_debug!("nps", "socks5 {} listening on {addr}", tunnel.remark);
-    for incoming in listener.incoming() {
-        let mut inbound = match incoming {
-            Ok(s) => s,
+    loop {
+        if shutdown.load(Ordering::SeqCst) || !tunnel_is_active(&registry, tunnel.id) {
+            break;
+        }
+        let mut inbound = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(err) => {
                 crate::log_warn!("nps", "socks5 accept failed: {err}");
                 continue;
@@ -996,9 +1127,14 @@ fn start_socks5_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<
     Ok(())
 }
 
-fn start_udp_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<()> {
+fn start_udp_listener(
+    registry: Arc<Registry>,
+    tunnel: Tunnel,
+    shutdown: Arc<AtomicBool>,
+) -> io::Result<()> {
     let addr = bind_addr(&tunnel);
     let socket = Arc::new(UdpSocket::bind(&addr)?);
+    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
     crate::log_info!(
         "nps",
         "tunnel task {} start mode:udp port {}",
@@ -1010,7 +1146,21 @@ fn start_udp_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<()>
     let mut buf = vec![0_u8; 64 * 1024];
 
     loop {
-        let (n, peer) = socket.recv_from(&mut buf)?;
+        if shutdown.load(Ordering::SeqCst) || !tunnel_is_active(&registry, tunnel.id) {
+            break;
+        }
+        let (n, peer) = match socket.recv_from(&mut buf) {
+            Ok(value) => value,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let packet = buf[..n].to_vec();
         let registry = Arc::clone(&registry);
         let tunnel = tunnel.clone();
@@ -1046,6 +1196,7 @@ fn start_udp_listener(registry: Arc<Registry>, tunnel: Tunnel) -> io::Result<()>
             }
         });
     }
+    Ok(())
 }
 
 fn start_http_host_listener(registry: Arc<Registry>) -> io::Result<()> {
@@ -1660,6 +1811,74 @@ fn validate_client_access(registry: &Arc<Registry>, vkey: &str, remote: &str) ->
         ));
     }
     if info.ip_white && !ip_in_list(&ip, &info.ip_white_list) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote ip is not in client whitelist",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_client_handshake(
+    registry: &Arc<Registry>,
+    vkey: &str,
+    remote: &str,
+    require_config_conn_allow: bool,
+) -> io::Result<()> {
+    if vkey.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid verification key",
+        ));
+    }
+    if require_config_conn_allow && vkey == registry.server.public_vkey {
+        return Ok(());
+    }
+
+    let ip = remote_ip(remote);
+    if registry.server.ip_limit && !ip.is_empty() && !is_ip_authorized(registry.as_ref(), &ip) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the ip {ip} is not in the validation list"),
+        ));
+    }
+    {
+        let global = registry.global.lock().unwrap();
+        if !ip.is_empty() && ip_in_list(&ip, &global.black_ip_list) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote ip is in global blacklist",
+            ));
+        }
+    }
+
+    let clients = registry.clients.lock().unwrap();
+    let Some(client) = clients.get(vkey) else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "invalid verification key",
+        ));
+    };
+    let info = &client.common.client;
+    if !info.status {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "client disabled",
+        ));
+    }
+    if require_config_conn_allow && !info.config_conn_allow {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "config connection is disabled for this client",
+        ));
+    }
+    if !ip.is_empty() && ip_in_list(&ip, &info.black_ip_list) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote ip is in client blacklist",
+        ));
+    }
+    if !ip.is_empty() && info.ip_white && !ip_in_list(&ip, &info.ip_white_list) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "remote ip is not in client whitelist",
@@ -2726,20 +2945,28 @@ fn client_json(
 pub fn mutate_client_status(registry: &Arc<Registry>, params: &HashMap<String, String>) -> String {
     let id = param(params, "id").parse::<u64>().unwrap_or(0);
     let status = param_bool(params, "status");
-    let modified = {
+    let changed = {
         let mut clients = registry.clients.lock().unwrap();
         if let Some(vkey) = client_vkey_by_id(&clients, id) {
             if let Some(config) = clients.get_mut(&vkey) {
+                let previous = config.clone();
                 config.common.client.status = status;
-                true
+                Some((vkey, previous, config.clone()))
             } else {
-                false
+                None
             }
         } else {
-            false
+            None
         }
     };
-    if modified {
+    if let Some((vkey, previous, current)) = changed {
+        stop_tunnel_runtimes(registry, &previous.tunnels);
+        if status {
+            start_active_tunnels_for_client(registry, &current);
+        } else {
+            terminate_client_connection(registry, &vkey, "client disabled");
+        }
+        rebuild_secret_registry(registry);
         persist_ajax(registry, "modified success")
     } else {
         ajax(0, "modified fail")
@@ -2751,13 +2978,15 @@ pub fn mutate_client_delete(registry: &Arc<Registry>, params: &HashMap<String, S
     let deleted = {
         let mut clients = registry.clients.lock().unwrap();
         if let Some(vkey) = client_vkey_by_id(&clients, id) {
-            clients.remove(&vkey);
-            true
+            clients.remove(&vkey).map(|config| (vkey, config))
         } else {
-            false
+            None
         }
     };
-    if deleted {
+    if let Some((vkey, removed)) = deleted {
+        stop_tunnel_runtimes(registry, &removed.tunnels);
+        terminate_client_connection(registry, &vkey, "client deleted");
+        rebuild_secret_registry(registry);
         persist_ajax(registry, "delete success")
     } else {
         ajax(0, "delete error")
@@ -2840,6 +3069,7 @@ pub fn mutate_client_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
         let Some(mut config) = clients.remove(&vkey) else {
             return ajax(0, "client ID not found");
         };
+        let previous = config.clone();
         config.common.vkey = new_vkey.clone();
         config.common.client.verify_key = new_vkey.clone();
         apply_client_form(&mut config.common.client, params);
@@ -2853,10 +3083,27 @@ pub fn mutate_client_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
         for host in &mut config.hosts {
             host.client_vkey = new_vkey.clone();
         }
+        let current = config.clone();
         clients.insert(new_vkey, config);
-        true
+        Some((vkey, previous, current))
     };
-    if edited {
+    if let Some((old_vkey, previous, current)) = edited {
+        if old_vkey != current.common.vkey || previous.common.client.status != current.common.client.status {
+            stop_tunnel_runtimes(registry, &previous.tunnels);
+            terminate_client_connection(
+                registry,
+                &old_vkey,
+                if old_vkey != current.common.vkey {
+                    "invalid verification key"
+                } else {
+                    "client disabled"
+                },
+            );
+            if current.common.client.status {
+                start_active_tunnels_for_client(registry, &current);
+            }
+        }
+        rebuild_secret_registry(registry);
         persist_ajax(registry, "save success")
     } else {
         ajax(0, "client ID not found")
@@ -2901,27 +3148,26 @@ pub fn mutate_tunnel_status(
     status: bool,
 ) -> String {
     let id = param(params, "id").parse::<u64>().unwrap_or(0);
-    let mut to_start = None;
     let modified = {
         let mut clients = registry.clients.lock().unwrap();
-        let mut found = false;
+        let mut result = None;
         for config in clients.values_mut() {
             if let Some(tunnel) = config.tunnels.iter_mut().find(|t| t.id == id) {
+                let previous = tunnel.clone();
                 tunnel.status = status;
                 tunnel.run_status = status;
-                if status {
-                    to_start = Some(tunnel.clone());
-                }
-                found = true;
+                result = Some((previous, tunnel.clone()));
                 break;
             }
         }
-        found
+        result
     };
-    if modified {
-        if let Some(tunnel) = to_start {
-            start_tunnel_task(Arc::clone(registry), tunnel);
+    if let Some((previous, current)) = modified {
+        stop_tunnel_runtime(registry, &previous);
+        if status {
+            start_tunnel_task(Arc::clone(registry), current);
         }
+        rebuild_secret_registry(registry);
         persist_ajax(
             registry,
             if status {
@@ -2939,18 +3185,18 @@ pub fn mutate_tunnel_delete(registry: &Arc<Registry>, params: &HashMap<String, S
     let id = param(params, "id").parse::<u64>().unwrap_or(0);
     let deleted = {
         let mut clients = registry.clients.lock().unwrap();
-        let mut removed = false;
+        let mut result = None;
         for config in clients.values_mut() {
-            let before = config.tunnels.len();
-            config.tunnels.retain(|t| t.id != id);
-            if config.tunnels.len() != before {
-                removed = true;
+            if let Some(index) = config.tunnels.iter().position(|t| t.id == id) {
+                result = Some(config.tunnels.remove(index));
                 break;
             }
         }
-        removed
+        result
     };
-    if deleted {
+    if let Some(tunnel) = deleted {
+        stop_tunnel_runtime(registry, &tunnel);
+        rebuild_secret_registry(registry);
         persist_ajax(registry, "delete success")
     } else {
         ajax(0, "delete error")
@@ -3049,6 +3295,7 @@ pub fn mutate_tunnel_add(registry: &Arc<Registry>, params: &HashMap<String, Stri
     }
     if let Some(tunnel) = should_start {
         start_tunnel_task(Arc::clone(registry), tunnel.clone());
+        rebuild_secret_registry(registry);
         match persist_registry(registry) {
             Ok(()) => ajax_with_id(1, "add success", tunnel.id),
             Err(err) => ajax(0, &format!("added but save failed: {err}")),
@@ -3060,12 +3307,12 @@ pub fn mutate_tunnel_add(registry: &Arc<Registry>, params: &HashMap<String, Stri
 
 pub fn mutate_tunnel_edit(registry: &Arc<Registry>, params: &HashMap<String, String>) -> String {
     let id = param(params, "id").parse::<u64>().unwrap_or(0);
-    let mut to_start = None;
     let modified = {
         let mut clients = registry.clients.lock().unwrap();
-        let mut found = false;
+        let mut result = None;
         for config in clients.values_mut() {
             if let Some(tunnel) = config.tunnels.iter_mut().find(|t| t.id == id) {
+                let previous = tunnel.clone();
                 let ports = param_any(params, &["ports", "port"]);
                 let requested_port = expand_ports(&ports).into_iter().next().unwrap_or(0);
                 if requested_port != tunnel.server_port {
@@ -3094,19 +3341,18 @@ pub fn mutate_tunnel_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
                 if let Err(err) = validate_tunnel_ports(&registry.server, tunnel) {
                     return ajax(0, &err.to_string());
                 }
-                if tunnel.status {
-                    to_start = Some(tunnel.clone());
-                }
-                found = true;
+                result = Some((previous, tunnel.clone()));
                 break;
             }
         }
-        found
+        result
     };
-    if modified {
-        if let Some(tunnel) = to_start {
-            start_tunnel_task(Arc::clone(registry), tunnel);
+    if let Some((previous, current)) = modified {
+        stop_tunnel_runtime(registry, &previous);
+        if current.status {
+            start_tunnel_task(Arc::clone(registry), current);
         }
+        rebuild_secret_registry(registry);
         persist_ajax(registry, "modified success")
     } else {
         ajax(0, "modified error")
@@ -3372,6 +3618,7 @@ service manager."#
 mod tests {
     use super::*;
     use std::fs;
+    use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 
     #[test]
     fn host_mutations_persist_to_store_files() {
@@ -3423,6 +3670,50 @@ mod tests {
     }
 
     #[test]
+    fn host_status_and_delete_take_effect_in_runtime_route_lookup() {
+        let root = temp_test_dir("rustnps-host-runtime");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 111, "host-runtime", false);
+
+        let add = HashMap::from([
+            ("client_id".to_string(), "111".to_string()),
+            ("host".to_string(), "example.com".to_string()),
+            ("target".to_string(), "127.0.0.1:8080".to_string()),
+            ("location".to_string(), "/api".to_string()),
+            ("scheme".to_string(), "http".to_string()),
+        ]);
+        assert!(mutate_host_add(&registry, &add).contains("add success"));
+
+        let host_id = {
+            let clients = registry.clients.lock().unwrap();
+            clients
+                .get("host-runtime")
+                .and_then(|client| client.hosts.first())
+                .map(|host| host.id)
+                .unwrap()
+        };
+
+        let route = find_host_route(&registry, "example.com", "/api/users", "http").unwrap();
+        assert_eq!(route.0.id, host_id);
+        assert_eq!(route.1, "127.0.0.1:8080");
+
+        let stop = HashMap::from([("id".to_string(), host_id.to_string())]);
+        assert!(mutate_host_status(&registry, &stop, true).contains("stop success"));
+        assert!(find_host_route(&registry, "example.com", "/api/users", "http").is_none());
+
+        let start = HashMap::from([("id".to_string(), host_id.to_string())]);
+        assert!(mutate_host_status(&registry, &start, false).contains("start success"));
+        let route = find_host_route(&registry, "example.com", "/api/users", "http").unwrap();
+        assert_eq!(route.0.id, host_id);
+
+        let delete = HashMap::from([("id".to_string(), host_id.to_string())]);
+        assert!(mutate_host_delete(&registry, &delete).contains("delete success"));
+        assert!(find_host_route(&registry, "example.com", "/api/users", "http").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn tunnel_mutations_persist_to_store_files() {
         let root = temp_test_dir("rustnps-tunnel-persist");
         let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
@@ -3465,6 +3756,145 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn validate_client_handshake_rejects_unknown_vkey() {
+        let root = temp_test_dir("rustnps-handshake-invalid");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+
+        let err = validate_client_handshake(&registry, "missing-vkey", "203.0.113.10:1234", false)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("invalid verification key"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabling_client_terminates_online_control() {
+        let root = temp_test_dir("rustnps-disable-client");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 303, "client-c", false);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        registry.controls.lock().unwrap().insert(
+            "client-c".to_string(),
+            ControlHandle {
+                tx,
+                version: "test".to_string(),
+                connected_at: SystemTime::now(),
+                remote_addr: "127.0.0.1:1234".to_string(),
+            },
+        );
+
+        let status = HashMap::from([
+            ("id".to_string(), "303".to_string()),
+            ("status".to_string(), "0".to_string()),
+        ]);
+        assert!(mutate_client_status(&registry, &status).contains("modified success"));
+        let stop = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match stop {
+            ServerMessage::Stop { reason } => assert!(reason.contains("disabled")),
+            other => panic!("unexpected control message: {other:?}"),
+        }
+        assert!(!registry.controls.lock().unwrap().contains_key("client-c"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rotating_client_vkey_terminates_old_online_connection() {
+        let root = temp_test_dir("rustnps-rotate-vkey");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 304, "old-vkey", false);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        registry.controls.lock().unwrap().insert(
+            "old-vkey".to_string(),
+            ControlHandle {
+                tx,
+                version: "test".to_string(),
+                connected_at: SystemTime::now(),
+                remote_addr: "127.0.0.1:1234".to_string(),
+            },
+        );
+
+        let edit = HashMap::from([
+            ("id".to_string(), "304".to_string()),
+            ("vkey".to_string(), "new-vkey".to_string()),
+            ("web_password".to_string(), "pass".to_string()),
+        ]);
+        assert!(mutate_client_edit(&registry, &edit).contains("save success"));
+
+        let stop = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        match stop {
+            ServerMessage::Stop { reason } => {
+                assert!(reason.contains("invalid verification key"));
+            }
+            other => panic!("unexpected control message: {other:?}"),
+        }
+
+        let clients = registry.clients.lock().unwrap();
+        assert!(clients.contains_key("new-vkey"));
+        assert!(!clients.contains_key("old-vkey"));
+        drop(clients);
+        assert!(!registry.controls.lock().unwrap().contains_key("old-vkey"));
+        assert!(
+            validate_client_handshake(&registry, "old-vkey", "127.0.0.1:1234", false).is_err()
+        );
+        validate_client_handshake(&registry, "new-vkey", "127.0.0.1:1234", false).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tunnel_edit_switches_listener_from_old_port_to_new_port() {
+        let root = temp_test_dir("rustnps-tunnel-hot-switch");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 404, "switch-vkey", false);
+
+        let old_port = free_tcp_port();
+        let mut new_port = free_tcp_port();
+        if new_port == old_port {
+            new_port = free_tcp_port();
+        }
+
+        let add = HashMap::from([
+            ("client_id".to_string(), "404".to_string()),
+            ("type".to_string(), "tcp".to_string()),
+            ("port".to_string(), old_port.to_string()),
+            ("target".to_string(), "127.0.0.1:22".to_string()),
+            ("remark".to_string(), "switch-test".to_string()),
+        ]);
+        assert!(mutate_tunnel_add(&registry, &add).contains("add success"));
+        assert!(wait_until_port_accepting(old_port));
+
+        let tunnel_id = {
+            let clients = registry.clients.lock().unwrap();
+            clients
+                .get("switch-vkey")
+                .and_then(|client| client.tunnels.first())
+                .map(|tunnel| tunnel.id)
+                .unwrap()
+        };
+
+        let edit = HashMap::from([
+            ("id".to_string(), tunnel_id.to_string()),
+            ("type".to_string(), "tcp".to_string()),
+            ("port".to_string(), new_port.to_string()),
+            ("target".to_string(), "127.0.0.1:22".to_string()),
+            ("remark".to_string(), "switch-test-edited".to_string()),
+        ]);
+        assert!(mutate_tunnel_edit(&registry, &edit).contains("modified success"));
+        assert!(wait_until_port_closed(old_port));
+        assert!(wait_until_port_accepting(new_port));
+
+        let delete = HashMap::from([("id".to_string(), tunnel_id.to_string())]);
+        assert!(mutate_tunnel_delete(&registry, &delete).contains("delete success"));
+        assert!(wait_until_port_closed(new_port));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn install_test_client(registry: &Arc<Registry>, id: u64, vkey: &str, no_store: bool) {
         let mut client = ClientRuntimeConfig::default();
         client.id = id;
@@ -3483,6 +3913,36 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn free_tcp_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn wait_until_port_accepting(port: u16) -> bool {
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        for _ in 0..40 {
+            if TcpStream::connect_timeout(&addr.into(), Duration::from_millis(50)).is_ok() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    fn wait_until_port_closed(port: u16) -> bool {
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+        for _ in 0..40 {
+            if TcpStream::connect_timeout(&addr.into(), Duration::from_millis(50)).is_err() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
     }
 
     #[test]

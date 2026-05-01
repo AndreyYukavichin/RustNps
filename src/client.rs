@@ -154,6 +154,7 @@ fn control_loop_with_reconnect(config: ClientRuntimeConfig) -> io::Result<()> {
         match control_loop(config.clone()) {
             Ok(()) => return Ok(()),
             Err(err) => {
+
                 if !config.common.auto_reconnection {
                     crate::log_error!("npc", "The connection server failed, error {err}");
                     return Err(err);
@@ -199,7 +200,7 @@ fn send_config(config: &ClientRuntimeConfig) -> io::Result<()> {
             }
             Ok(())
         }
-        ServerMessage::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+        ServerMessage::Error { message } => Err(classify_server_error(message)),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unexpected config response: {other:?}"),
@@ -219,7 +220,7 @@ fn control_loop(config: ClientRuntimeConfig) -> io::Result<()> {
     match read_message::<ServerMessage>(&mut stream)? {
         ServerMessage::Ok { .. } => {}
         ServerMessage::Error { message } => {
-            return Err(io::Error::new(io::ErrorKind::Other, message))
+            return Err(classify_server_error(message))
         }
         other => {
             return Err(io::Error::new(
@@ -253,11 +254,40 @@ fn control_loop(config: ClientRuntimeConfig) -> io::Result<()> {
                 write_message(&mut stream, &ok("pong"))?;
             }
             ServerMessage::Stop { reason } => {
-                return Err(io::Error::new(io::ErrorKind::Interrupted, reason));
+                return Err(classify_server_error(reason));
             }
             ServerMessage::Ok { .. } | ServerMessage::Error { .. } => {}
         }
     }
+}
+
+fn classify_server_error(message: String) -> io::Error {
+    if is_invalid_vkey_message(&message) {
+        return io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Invalid verification key, connection failed, please reconfigure the vkey parameter.",
+        );
+    }
+    if is_fatal_server_message(&message) {
+        return io::Error::new(io::ErrorKind::PermissionDenied, message);
+    }
+    io::Error::new(io::ErrorKind::Other, message)
+}
+
+fn is_invalid_vkey_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("invalid verification key")
+        || lower.contains("validation key")
+        || lower.contains("key incorrect")
+        || message.contains("密钥错误")
+}
+
+fn is_fatal_server_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    is_invalid_vkey_message(message)
+        || lower.contains("client disabled")
+        || lower.contains("client deleted")
+        || lower.contains("config connection is disabled")
 }
 
 fn handle_open(

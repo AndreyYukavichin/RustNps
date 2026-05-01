@@ -36,8 +36,8 @@ $("#table").bootstrapTable({
         {field:"option", title:'<span langtag="word-option"></span>', formatter:function(v,row){
             let btn='<div class="btn-group">';
             if (window.rustnpsIsAdmin) {
-                btn += row.Status ? '<a onclick="submitform(\'stop\', \'{{base}}/client/changestatus\', {id:row.Id, status:0})" class="btn btn-outline btn-warning"><i class="fa fa-pause"></i></a>' : '<a onclick="submitform(\'start\', \'{{base}}/client/changestatus\', {id:row.Id, status:1})" class="btn btn-outline btn-primary"><i class="fa fa-play"></i></a>';
-                btn += '<a onclick="submitform(\'delete\', \'{{base}}/client/del\', {id:row.Id})" class="btn btn-outline btn-danger"><i class="fa fa-trash"></i></a>';
+                btn += row.Status ? '<a onclick="submitform(\'stop\', \'{{base}}/client/changestatus\', {id:' + row.Id + ', status:0})" class="btn btn-outline btn-warning"><i class="fa fa-pause"></i></a>' : '<a onclick="submitform(\'start\', \'{{base}}/client/changestatus\', {id:' + row.Id + ', status:1})" class="btn btn-outline btn-primary"><i class="fa fa-play"></i></a>';
+                btn += '<a onclick="submitform(\'delete\', \'{{base}}/client/del\', {id:' + row.Id + '})" class="btn btn-outline btn-danger"><i class="fa fa-trash"></i></a>';
             }
             btn += '<a href="{{base}}/client/edit?id='+row.Id+'" class="btn btn-outline btn-success"><i class="fa fa-edit"></i></a>';
             btn += '<a href="{{base}}/index/all?client_id='+row.Id+'" class="btn btn-outline btn-primary" langtag="word-tunnel"></a>';
