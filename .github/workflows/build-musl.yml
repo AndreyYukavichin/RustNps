@@ -4,6 +4,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional tag name for artifact naming, for example v0.1.4'
+        required: false
+        type: string
 
 jobs:
   build-musl:
@@ -39,13 +44,16 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-          TAG=${GITHUB_REF##*/}
+          TAG=${GITHUB_REF_NAME}
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          fi
           RNPS_NAME=rnps-${TAG}-linux-x86_64
           RNPC_NAME=rnpc-${TAG}-linux-x86_64
           cp target/x86_64-unknown-linux-musl/release/rnps dist/${RNPS_NAME}
           cp target/x86_64-unknown-linux-musl/release/rnpc dist/${RNPC_NAME}
-          tar -C dist -czf ${RNPS_NAME}.tar.gz ${RNPS_NAME}
-          tar -C dist -czf ${RNPC_NAME}.tar.gz ${RNPC_NAME}
+          tar -C dist -czf dist/${RNPS_NAME}.tar.gz ${RNPS_NAME}
+          tar -C dist -czf dist/${RNPC_NAME}.tar.gz ${RNPC_NAME}
           sha256sum dist/${RNPS_NAME}.tar.gz > dist/${RNPS_NAME}.tar.gz.sha256
           sha256sum dist/${RNPC_NAME}.tar.gz > dist/${RNPC_NAME}.tar.gz.sha256
 
