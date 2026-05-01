@@ -1,0 +1,41 @@
+name: Build (musl static)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build static musl binaries (docker)
+        run: |
+          docker run --rm -v "${GITHUB_WORKSPACE}":/home/rust/src ekidd/rust-musl-builder:latest /bin/bash -lc "\
+            cargo build --release --bin rnps --target x86_64-unknown-linux-musl && \
+            cargo build --release --bin rnpc --target x86_64-unknown-linux-musl\
+          "
+
+      - name: Package artifacts
+        run: |
+          set -e
+          mkdir -p dist
+          TAG=${GITHUB_REF##*/}
+          RNPS_NAME=rnps-${TAG}-linux-x86_64
+          RNPC_NAME=rnpc-${TAG}-linux-x86_64
+          cp target/x86_64-unknown-linux-musl/release/rnps dist/${RNPS_NAME}
+          cp target/x86_64-unknown-linux-musl/release/rnpc dist/${RNPC_NAME}
+          tar -C dist -czf ${RNPS_NAME}.tar.gz ${RNPS_NAME}
+          tar -C dist -czf ${RNPC_NAME}.tar.gz ${RNPC_NAME}
+          sha256sum dist/${RNPS_NAME}.tar.gz > dist/${RNPS_NAME}.tar.gz.sha256
+          sha256sum dist/${RNPC_NAME}.tar.gz > dist/${RNPC_NAME}.tar.gz.sha256
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rnps-musl-artifacts
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
