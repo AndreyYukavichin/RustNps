@@ -142,17 +142,21 @@ async fn handle_captcha(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let token = params.get("token").cloned().unwrap_or_default();
+    crate::log_trace!("web", "captcha request token={}", token);
     if let Some(svg) = server::captcha_svg(registry.as_ref(), &token) {
         ([("content-type", "image/svg+xml; charset=utf-8")], svg).into_response()
     } else {
+        crate::log_warn!("web", "captcha request miss token={}", token);
         StatusCode::NOT_FOUND.into_response()
     }
 }
 
 async fn handle_register(State(registry): State<Arc<Registry>>) -> Html<String> {
     if !registry.server.allow_user_register {
+        crate::log_warn!("web", "register page denied, allow_user_register=false");
         return Html(render_login(&registry, "register is not allow"));
     }
+    crate::log_trace!("web", "register page opened");
     Html(load_view(
         "register.html",
         &HashMap::from([("base".to_string(), registry.server.web_base_url.clone())]),
@@ -163,6 +167,11 @@ async fn handle_register_submit(
     State(registry): State<Arc<Registry>>,
     Form(params): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
+    crate::log_info!(
+        "web",
+        "register submit username={}",
+        params.get("username").cloned().unwrap_or_default()
+    );
     let res = server::register_web_user(&registry, &params);
     axum::Json(serde_json::from_str::<Value>(&res).unwrap())
 }
@@ -175,11 +184,13 @@ async fn handle_login_verify(
 ) -> impl IntoResponse {
     let username = params.get("username").cloned().unwrap_or_default();
     let password = params.get("password").cloned().unwrap_or_default();
+    crate::log_info!("web", "login verify username={} remote={}", username, remote_addr);
 
     if registry.server.open_captcha {
         let captcha_token = params.get("captcha_token").cloned().unwrap_or_default();
         let captcha = params.get("captcha").cloned().unwrap_or_default();
         if !server::verify_login_captcha(registry.as_ref(), &captcha_token, &captcha) {
+            crate::log_warn!("web", "login captcha verify failed username={} remote={}", username, remote_addr);
             return (
                 jar,
                 axum::Json(serde_json::json!({
@@ -215,6 +226,8 @@ async fn handle_login_verify(
             axum::Json(serde_json::json!({ "status": 1, "msg": "login success" })),
         )
     } else {
+        let _ = password;
+        crate::log_warn!("web", "login failed username={} remote={}", username, remote_addr);
         (
             jar,
             axum::Json(serde_json::json!({ "status": 0, "msg": "username or password incorrect" })),

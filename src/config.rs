@@ -129,6 +129,10 @@ fn parse_common(kv: &SectionMap) -> CommonConfig {
     c.client.max_conn = get_usize(kv, "max_conn", 0);
     c.client.remark = get_string(kv, "remark", "");
     c.client.max_tunnel_num = get_usize(kv, "max_tunnel_num", 0);
+    c.client.black_ip_list = get_list(kv, &["black_ip_list", "blackiplist"]);
+    c.client.ip_white = get_bool_alias(kv, &["ip_white", "ipwhite"], c.client.ip_white);
+    c.client.ip_white_pass = get_string_alias(kv, &["ip_white_pass", "ipwhitepass"], "");
+    c.client.ip_white_list = get_list(kv, &["ip_white_list", "ipwhitelist"]);
     c
 }
 
@@ -344,6 +348,12 @@ fn get_string(kv: &SectionMap, key: &str, default: &str) -> String {
     kv.get(key).cloned().unwrap_or_else(|| default.to_string())
 }
 
+fn get_string_alias(kv: &SectionMap, keys: &[&str], default: &str) -> String {
+    keys.iter()
+        .find_map(|key| kv.get(*key).cloned())
+        .unwrap_or_else(|| default.to_string())
+}
+
 fn get_bool(kv: &SectionMap, key: &str, default: bool) -> bool {
     kv.get(key)
         .map(|v| {
@@ -353,6 +363,33 @@ fn get_bool(kv: &SectionMap, key: &str, default: bool) -> bool {
             )
         })
         .unwrap_or(default)
+}
+
+fn get_bool_alias(kv: &SectionMap, keys: &[&str], default: bool) -> bool {
+    keys.iter()
+        .find_map(|key| kv.get(*key))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn get_list(kv: &SectionMap, keys: &[&str]) -> Vec<String> {
+    keys.iter()
+        .find_map(|key| kv.get(*key))
+        .map(|value| {
+            value
+                .replace(',', "\n")
+                .lines()
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn get_u16(kv: &SectionMap, key: &str, default: u16) -> u16 {
@@ -371,4 +408,42 @@ fn get_usize(kv: &SectionMap, key: &str, default: usize) -> usize {
     kv.get(key)
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_client_config;
+    use std::fs;
+
+    #[test]
+    fn load_client_config_parses_ip_white_fields() {
+        let root = std::env::temp_dir().join(format!(
+            "rustnps-config-ipwhite-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let conf = root.join("npc.conf");
+        fs::write(
+            &conf,
+            "[common]\nserver_addr=127.0.0.1:18024\nvkey=test\nipwhite=1\nipwhitepass=a+b c/?\nipwhitelist=127.0.0.1,198.51.100.7\nblackiplist=203.0.113.1,203.0.113.2\n\n[web]\nhost=127.0.0.1\ntarget_addr=127.0.0.1:8080\nlocation=/\n",
+        )
+        .unwrap();
+
+        let config = load_client_config(&conf).unwrap();
+        assert!(config.common.client.ip_white);
+        assert_eq!(config.common.client.ip_white_pass, "a+b c/?");
+        assert_eq!(
+            config.common.client.ip_white_list,
+            vec!["127.0.0.1".to_string(), "198.51.100.7".to_string()]
+        );
+        assert_eq!(
+            config.common.client.black_ip_list,
+            vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 }

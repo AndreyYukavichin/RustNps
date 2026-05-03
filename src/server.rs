@@ -524,6 +524,31 @@ fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Res
             );
             update_client_last_online_addr(&registry, &vkey, &remote_addr);
             for msg in rx {
+                match &msg {
+                    ServerMessage::Open { link_id, link } => {
+                        crate::log_debug!(
+                            "nps",
+                            "control write open vkey={} link_id={} kind={:?} target={} remote={}",
+                            vkey,
+                            link_id,
+                            link.kind,
+                            link.target,
+                            link.remote_addr
+                        );
+                    }
+                    ServerMessage::Ping => {
+                        crate::log_trace!("nps", "control write ping vkey={}", vkey);
+                    }
+                    ServerMessage::Stop { reason } => {
+                        crate::log_debug!("nps", "control write stop vkey={} reason={}", vkey, reason);
+                    }
+                    ServerMessage::Ok { message } => {
+                        crate::log_trace!("nps", "control write ok vkey={} message={}", vkey, message);
+                    }
+                    ServerMessage::Error { message } => {
+                        crate::log_debug!("nps", "control write error vkey={} message={}", vkey, message);
+                    }
+                }
                 if let Err(err) = write_message(&mut stream, &msg) {
                     crate::log_warn!("nps", "control write to {vkey} failed: {err}");
                     break;
@@ -1526,6 +1551,21 @@ fn start_http_host_listener(registry: Arc<Registry>) -> io::Result<()> {
                 let _ = write_custom_404(&mut inbound, &registry);
                 return;
             };
+            match handle_host_ip_white_auth(
+                &registry,
+                &route,
+                &remote,
+                &head,
+                &mut inbound,
+                registry.server.http_proxy_port,
+            ) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(err) => {
+                    crate::log_warn!("nps", "host ip white auth handling failed: {err}");
+                    return;
+                }
+            }
             match prepare_host_proxy_request(&registry, &route, &remote, &head, "http") {
                 Ok((prepared_head, cache_key)) => {
                     if let Err(err) = proxy_host_request(
@@ -1650,6 +1690,21 @@ fn handle_https_host_conn(inbound: TcpStream, registry: Arc<Registry>) -> io::Re
         let _ = write_custom_404(&mut tls_stream, &registry);
         return Ok(());
     };
+    match handle_host_ip_white_auth(
+        &registry,
+        &route,
+        &remote,
+        &head,
+        &mut tls_stream,
+        registry.server.https_proxy_port,
+    ) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(err) => {
+            crate::log_warn!("nps", "https host ip white auth handling failed: {err}");
+            return Ok(());
+        }
+    }
     let client_id = registry
         .clients
         .lock()
@@ -1767,12 +1822,27 @@ fn request_client_stream(
     let link_id = registry.next_link_id();
     let (tx, rx) = mpsc::channel();
     registry.pending.lock().unwrap().insert(link_id, tx);
+    crate::log_debug!(
+        "nps",
+        "request client stream queued open vkey={} link_id={} kind={:?} target={} remote={}",
+        vkey,
+        link_id,
+        link.kind,
+        link.target,
+        link.remote_addr
+    );
 
     if control
         .tx
         .send(ServerMessage::Open { link_id, link })
         .is_err()
     {
+        crate::log_warn!(
+            "nps",
+            "request client stream send open failed vkey={} link_id={}",
+            vkey,
+            link_id
+        );
         if slot_reserved {
             release_client_connection_slot(registry, vkey);
         }
@@ -1782,11 +1852,24 @@ fn request_client_stream(
             "control channel closed",
         ));
     }
+    crate::log_debug!(
+        "nps",
+        "request client stream open dispatched vkey={} link_id={} waiting_for_data=true",
+        vkey,
+        link_id
+    );
 
     match rx.recv_timeout(Duration::from_secs(
         registry.server.disconnect_timeout.max(10),
     )) {
         Ok(stream) => {
+            crate::log_debug!(
+                "nps",
+                "request client stream data accepted vkey={} link_id={} via_mux={}",
+                vkey,
+                link_id,
+                stream.as_ref().as_any().is::<crate::mux::MuxStream>()
+            );
             let is_mux_stream = stream.as_ref().as_any().is::<crate::mux::MuxStream>();
             let wrapped = wrap_server_transport(
                 stream,
@@ -1807,10 +1890,12 @@ fn request_client_stream(
         Err(err) => {
             crate::log_warn!(
                 "nps",
-                "client stream timeout vkey={} link_id={} err={}",
+                "client stream timeout vkey={} link_id={} err={} controls_present={} pending_present={}",
                 vkey,
                 link_id,
-                err
+                err,
+                registry.controls.lock().unwrap().contains_key(vkey),
+                registry.pending.lock().unwrap().contains_key(&link_id)
             );
             if slot_reserved {
                 release_client_connection_slot(registry, vkey);
@@ -2326,7 +2411,17 @@ pub fn authorize_ip(registry: &Registry, remote: &str, hours: u32) {
         return;
     }
     let expires_at = SystemTime::now() + Duration::from_secs(u64::from(hours.max(1)) * 3600);
-    registry.authorized_ips.lock().unwrap().insert(ip, expires_at);
+    registry
+        .authorized_ips
+        .lock()
+        .unwrap()
+        .insert(ip.clone(), expires_at);
+    crate::log_info!(
+        "web",
+        "客户端IP白名单认证授权成功: ip [{}] validity [{}]h",
+        ip,
+        hours.max(1)
+    );
 }
 
 fn is_ip_authorized(registry: &Registry, ip: &str) -> bool {
@@ -2429,6 +2524,184 @@ fn build_tls_config_for_registry(registry: &Arc<Registry>) -> io::Result<Option<
 enum HostProxyError {
     Unauthorized,
     InvalidRequest,
+}
+
+fn handle_host_ip_white_auth<W: Write + ?Sized>(
+    registry: &Arc<Registry>,
+    route: &Host,
+    remote: &str,
+    head: &[u8],
+    stream: &mut W,
+    port: u16,
+) -> io::Result<bool> {
+    let ip = remote_ip(remote);
+    let Some((ip_white, ip_white_pass, ip_white_list, no_store)) = registry
+        .clients
+        .lock()
+        .unwrap()
+        .get(&route.client_vkey)
+        .map(|client| {
+            (
+                client.common.client.ip_white,
+                client.common.client.ip_white_pass.clone(),
+                client.common.client.ip_white_list.clone(),
+                client.no_store,
+            )
+        })
+    else {
+        return Ok(false);
+    };
+    if !ip_white || ip_white_pass.is_empty() || ip.is_empty() || ip_in_list(&ip, &ip_white_list) {
+        return Ok(false);
+    }
+
+    let Some((method, path, _)) = parse_http_request_line(head) else {
+        return Ok(false);
+    };
+    if method.eq_ignore_ascii_case("POST") && path.starts_with("/authIp") {
+        handle_host_ip_white_submit(
+            registry,
+            route,
+            &ip,
+            &ip_white_pass,
+            &path,
+            stream,
+            no_store,
+        )?;
+        return Ok(true);
+    }
+
+    write_ip_white_auth_page(stream, registry, &ip, port)?;
+    Ok(true)
+}
+
+fn handle_host_ip_white_submit<W: Write + ?Sized>(
+    registry: &Arc<Registry>,
+    route: &Host,
+    ip: &str,
+    expected_pass: &str,
+    path: &str,
+    stream: &mut W,
+    no_store: bool,
+) -> io::Result<()> {
+    let supplied_pass = path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .and_then(|query| {
+            query.split('&').find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                if key == "pass" {
+                    Some(url_decode_component(value))
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_default();
+
+    let (success, message) = if supplied_pass == expected_pass {
+        let mut added = false;
+        {
+            let mut clients = registry.clients.lock().unwrap();
+            if let Some(client) = clients.get_mut(&route.client_vkey) {
+                if !ip_in_list(ip, &client.common.client.ip_white_list) {
+                    client.common.client.ip_white_list.push(ip.to_string());
+                    added = true;
+                }
+            }
+        }
+        if added && !no_store {
+            let _ = persist_registry(registry);
+        }
+        crate::log_info!(
+            "web",
+            "客户端IP白名单认证授权成功:vkey [{}] ip [{}] password [{}]",
+            route.client_vkey,
+            ip,
+            supplied_pass
+        );
+        (true, "授权成功")
+    } else {
+        crate::log_error!(
+            "web",
+            "客户端IP白名单认证授权密码错误:vkey [{}] ip [{}] password [{}]",
+            route.client_vkey,
+            ip,
+            supplied_pass
+        );
+        (false, "密码错误")
+    };
+
+    let body = format!("{{\"success\":{},\"message\":\"{}\"}}", success, message);
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()
+}
+
+fn url_decode_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut percent_bytes = Vec::new();
+    let mut percent_raw = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                flush_percent_buffer(&mut out, &mut percent_bytes, &mut percent_raw);
+                out.push(' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                if let (Some(high), Some(low)) = (
+                    hex_value(bytes[index + 1]),
+                    hex_value(bytes[index + 2]),
+                ) {
+                    percent_bytes.push((high << 4) | low);
+                    percent_raw.push('%');
+                    percent_raw.push(bytes[index + 1] as char);
+                    percent_raw.push(bytes[index + 2] as char);
+                    index += 3;
+                } else {
+                    flush_percent_buffer(&mut out, &mut percent_bytes, &mut percent_raw);
+                    out.push('%');
+                    index += 1;
+                }
+            }
+            byte => {
+                flush_percent_buffer(&mut out, &mut percent_bytes, &mut percent_raw);
+                out.push(byte as char);
+                index += 1;
+            }
+        }
+    }
+    flush_percent_buffer(&mut out, &mut percent_bytes, &mut percent_raw);
+    out
+}
+
+fn flush_percent_buffer(out: &mut String, percent_bytes: &mut Vec<u8>, percent_raw: &mut String) {
+    if percent_bytes.is_empty() {
+        return;
+    }
+    if let Ok(text) = std::str::from_utf8(percent_bytes) {
+        out.push_str(text);
+    } else {
+        out.push_str(percent_raw);
+    }
+    percent_bytes.clear();
+    percent_raw.clear();
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn prepare_host_proxy_request(
@@ -2568,12 +2841,7 @@ where
         }
         Err(err) => {
             crate::log_notice!("nps", "connect to target {} error {}", target_for_log, err);
-            write_http_response(
-                &mut inbound,
-                "502 Bad Gateway",
-                "text/plain",
-                b"client offline",
-            )?;
+            write_connection_fail(&mut inbound)?;
             return Err(err);
         }
     };
@@ -2654,17 +2922,23 @@ fn is_cacheable_path(path: &str) -> bool {
 
 fn write_custom_404<W: Write + ?Sized>(stream: &mut W, registry: &Registry) -> io::Result<()> {
     let body = load_error_page(registry).unwrap_or_else(|_| b"nps 404".to_vec());
-    write_http_response(stream, "404 Not Found", "text/html; charset=utf-8", &body)
+    let content_type = if body == b"nps 404" {
+        "text/plain; charset=utf-8"
+    } else {
+        "text/html; charset=utf-8"
+    };
+    write_http_response(stream, "404 Not Found", content_type, &body)
 }
 
 fn write_basic_auth_required<W: Write + ?Sized>(stream: &mut W) -> io::Result<()> {
-    let body = b"401 Unauthorized";
-    let header = format!(
-        "HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nWWW-Authenticate: Basic realm=\"easyProxy\"\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(header.as_bytes())?;
-    stream.write_all(body)?;
+    stream.write_all(
+        b"HTTP/1.1 401 Unauthorized\nContent-Type: text/plain; charset=utf-8\nWWW-Authenticate: Basic realm=\"easyProxy\"\n\n401 Unauthorized",
+    )?;
+    stream.flush()
+}
+
+fn write_connection_fail<W: Write + ?Sized>(stream: &mut W) -> io::Result<()> {
+    stream.write_all(b"HTTP/1.1 404 Not Found\r\n\r\n")?;
     stream.flush()
 }
 
@@ -2698,6 +2972,48 @@ fn load_error_page(registry: &Registry) -> io::Result<Vec<u8>> {
         io::ErrorKind::NotFound,
         "error page not found",
     ))
+}
+
+fn write_ip_white_auth_page<W: Write + ?Sized>(
+    stream: &mut W,
+    registry: &Registry,
+    ip: &str,
+    port: u16,
+) -> io::Result<()> {
+    let body = load_auth_page(registry, ip, port)?;
+    write_http_response(stream, "401 Unauthorized", "text/html; charset=utf-8", &body)
+}
+
+fn load_auth_page(registry: &Registry, ip: &str, port: u16) -> io::Result<Vec<u8>> {
+    let mut candidates = Vec::new();
+    candidates.push(
+        registry
+            .store
+            .conf_dir()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("web")
+            .join("static")
+            .join("page")
+            .join("auth.html"),
+    );
+    candidates.push(Path::new("web").join("static").join("page").join("auth.html"));
+    candidates.push(
+        Path::new("RustNps")
+            .join("web")
+            .join("static")
+            .join("page")
+            .join("auth.html"),
+    );
+    for candidate in candidates {
+        if let Ok(bytes) = fs::read(&candidate) {
+            let body = String::from_utf8_lossy(&bytes)
+                .replace("${ip}", ip)
+                .replace("${port}", &port.to_string());
+            return Ok(body.into_bytes());
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "auth page not found"))
 }
 
 fn route_supports_scheme(route: &Host, scheme: &str) -> bool {
@@ -2880,9 +3196,11 @@ pub fn authenticate_web_user(
     password: &str,
 ) -> Option<WebSession> {
     if username == registry.server.web_username && password == registry.server.web_password {
+        crate::log_info!("web", "web login success, role=admin username={}", username);
         return Some(WebSession::admin(username.to_string()));
     }
     if !registry.server.allow_user_login {
+        crate::log_warn!("web", "web login rejected, allow_user_login=false username={}", username);
         return None;
     }
 
@@ -2900,6 +3218,12 @@ pub fn authenticate_web_user(
             && info.web_username == username
             && info.web_password == password;
         if default_user_login || explicit_user_login {
+            crate::log_info!(
+                "web",
+                "web login success, role=client client_id={} username={}",
+                client.id,
+                username
+            );
             Some(WebSession::client(client.id, username.to_string()))
         } else {
             None
@@ -2926,8 +3250,10 @@ pub fn captcha_svg(registry: &Registry, token: &str) -> Option<String> {
     let (code, expires_at) = store.get(token).map(|entry| (entry.code.clone(), entry.expires_at))?;
     if expires_at <= now {
         store.remove(token);
+        crate::log_warn!("web", "captcha expired token={}", token);
         return None;
     }
+    crate::log_trace!("web", "captcha served token={}", token);
     Some(render_captcha_svg(&code))
 }
 
@@ -2942,12 +3268,20 @@ pub fn verify_login_captcha(registry: &Registry, token: &str, answer: &str) -> b
     }
     let mut store = registry.captcha_store.lock().unwrap();
     let Some(entry) = store.remove(token) else {
+        crate::log_warn!("web", "captcha verify failed, token missing token={}", token);
         return false;
     };
     if entry.expires_at <= SystemTime::now() {
+        crate::log_warn!("web", "captcha verify failed, token expired token={}", token);
         return false;
     }
-    entry.code.eq_ignore_ascii_case(answer)
+    let ok = entry.code.eq_ignore_ascii_case(answer);
+    if ok {
+        crate::log_info!("web", "captcha verify success token={}", token);
+    } else {
+        crate::log_warn!("web", "captcha verify failed, answer mismatch token={}", token);
+    }
+    ok
 }
 
 fn issue_login_captcha(registry: &Registry) -> Option<String> {
@@ -2960,6 +3294,7 @@ fn issue_login_captcha(registry: &Registry) -> Option<String> {
         token.clone(),
         CaptchaEntry { code, expires_at },
     );
+    crate::log_trace!("web", "captcha issued token={}", token);
     Some(token)
 }
 
@@ -2996,11 +3331,13 @@ pub fn authorize_web_login_ip(registry: &Registry, remote: &str) {
 
 pub fn register_web_user(registry: &Arc<Registry>, params: &HashMap<String, String>) -> String {
     if !registry.server.allow_user_register {
+        crate::log_warn!("web", "web register rejected, allow_user_register=false");
         return ajax(0, "register is not allow");
     }
     let username = param(params, "username");
     let password = param(params, "password");
     if username.is_empty() || password.is_empty() || username == registry.server.web_username {
+        crate::log_warn!("web", "web register rejected, invalid input username={}", username);
         return ajax(0, "please check your input");
     }
 
@@ -3010,6 +3347,7 @@ pub fn register_web_user(registry: &Arc<Registry>, params: &HashMap<String, Stri
             .values()
             .any(|client| client.common.client.web_username == username)
         {
+            crate::log_warn!("web", "web register rejected, duplicate username={}", username);
             return ajax(0, "web login username duplicate, please reset");
         }
     }
@@ -3035,6 +3373,7 @@ pub fn register_web_user(registry: &Arc<Registry>, params: &HashMap<String, Stri
     config.common.client.web_password = password;
     config.common.client.config_conn_allow = false;
 
+    crate::log_info!("web", "web register success username={} vkey={}", config.common.client.web_username, vkey);
     registry.clients.lock().unwrap().insert(vkey, config);
     persist_ajax(registry, "register success")
 }
@@ -4049,9 +4388,14 @@ service manager."#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::generate_simple_self_signed;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
     use std::io::{Read, Write};
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+    use std::sync::Arc as StdArc;
+    use std::thread;
 
     #[test]
     fn host_mutations_persist_to_store_files() {
@@ -4366,6 +4710,221 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn auth_ip_submit_decodes_percent_encoded_password() {
+        let root = temp_test_dir("rustnps-auth-ip-decode");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 606, "decode-vkey", true);
+        {
+            let mut clients = registry.clients.lock().unwrap();
+            let client = clients.get_mut("decode-vkey").unwrap();
+            client.common.client.ip_white = true;
+            client.common.client.ip_white_pass = "a+b c/?".to_string();
+        }
+
+        let route = Host {
+            client_vkey: "decode-vkey".to_string(),
+            ..Host::default()
+        };
+        let mut response = Vec::new();
+        handle_host_ip_white_submit(
+            &registry,
+            &route,
+            "203.0.113.10",
+            "a+b c/?",
+            "/authIp?pass=a%2Bb+c%2F%3F",
+            &mut response,
+            true,
+        )
+        .unwrap();
+
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.contains("{\"success\":true,\"message\":\"授权成功\"}"));
+        let clients = registry.clients.lock().unwrap();
+        assert!(clients
+            .get("decode-vkey")
+            .unwrap()
+            .common
+            .client
+            .ip_white_list
+            .contains(&"203.0.113.10".to_string()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn url_decode_component_handles_utf8_and_bad_percent_sequences() {
+        assert_eq!(url_decode_component("%E4%BD%A0%E5%A5%BD+rust"), "你好 rust");
+        assert_eq!(url_decode_component("abc%2Gdef%"), "abc%2Gdef%");
+        assert_eq!(url_decode_component("%E4%BD%A0%FF"), "%E4%BD%A0%FF");
+    }
+
+    #[test]
+    fn http_replay_matches_go_like_response_shapes() {
+        let root = temp_test_dir("rustnps-http-replay");
+        write_test_page_assets(&root);
+        let registry = Arc::new(Registry::new(
+            ServerConfig::default(),
+            PersistentStore::new(root.join("conf")),
+        ));
+        install_test_client(&registry, 707, "http-auth", true);
+        {
+            let mut clients = registry.clients.lock().unwrap();
+            let client = clients.get_mut("http-auth").unwrap();
+            client.common.client.ip_white = true;
+            client.common.client.ip_white_pass = "secret pass".to_string();
+        }
+
+        let auth_route = Host {
+            client_vkey: "http-auth".to_string(),
+            host: "example.com".to_string(),
+            ..Host::default()
+        };
+
+        let auth_registry = Arc::clone(&registry);
+        let auth_response = replay_http(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            move |mut socket| {
+                let head = read_http_head(&mut socket, 16 * 1024)?;
+                let handled = handle_host_ip_white_auth(
+                    &auth_registry,
+                    &auth_route,
+                    "203.0.113.20:4567",
+                    &head,
+                    &mut socket,
+                    8024,
+                )?;
+                assert!(handled);
+                Ok(())
+            },
+        );
+        let auth_text = String::from_utf8(auth_response).unwrap();
+        assert!(auth_text.starts_with("HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "));
+        assert!(auth_text.contains("<title>NPS访问验证</title>"));
+        assert!(auth_text.contains("203.0.113.20"));
+        assert!(auth_text.contains("xhr.open(\"post\", \"/authIp?pass=\" + pwd)"));
+
+        let basic_auth_response = replay_http(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", |mut socket| {
+            write_basic_auth_required(&mut socket)
+        });
+        assert_eq!(
+            String::from_utf8(basic_auth_response).unwrap(),
+            "HTTP/1.1 401 Unauthorized\nContent-Type: text/plain; charset=utf-8\nWWW-Authenticate: Basic realm=\"easyProxy\"\n\n401 Unauthorized"
+        );
+
+        let not_found_response = replay_http(b"GET /missing HTTP/1.1\r\nHost: example.com\r\n\r\n", {
+            let registry = Arc::clone(&registry);
+            move |mut socket| write_custom_404(&mut socket, &registry)
+        });
+        let not_found_text = String::from_utf8(not_found_response).unwrap();
+        assert!(not_found_text.starts_with("HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "));
+        assert!(
+            not_found_text.contains("<title>nps error</title>")
+                || not_found_text.contains("404 not found")
+                || not_found_text.contains("nps 404"),
+            "unexpected 404 response: {not_found_text}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn https_replay_matches_go_like_response_shapes() {
+        let root = temp_test_dir("rustnps-https-replay");
+        write_test_page_assets(&root);
+        let registry = Arc::new(Registry::new(
+            ServerConfig::default(),
+            PersistentStore::new(root.join("conf")),
+        ));
+
+        let cert = generate_simple_self_signed(vec!["example.com".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        let cert_der: CertificateDer<'static> = cert.cert.der().clone();
+
+        install_test_client(&registry, 808, "https-auth", true);
+        {
+            let mut clients = registry.clients.lock().unwrap();
+            let client = clients.get_mut("https-auth").unwrap();
+            client.common.client.ip_white = true;
+            client.common.client.ip_white_pass = "secret pass".to_string();
+            client.hosts.push(Host {
+                host: "example.com".to_string(),
+                scheme: "https".to_string(),
+                cert_file_path: cert_pem.clone(),
+                key_file_path: key_pem.clone(),
+                client_vkey: "https-auth".to_string(),
+                ..Host::default()
+            });
+        }
+
+        let tls_config = build_tls_config_for_registry(&registry)
+            .unwrap()
+            .expect("tls config");
+        let auth_route = Host {
+            client_vkey: "https-auth".to_string(),
+            host: "example.com".to_string(),
+            ..Host::default()
+        };
+
+        let auth_registry = Arc::clone(&registry);
+        let auth_response = replay_https(
+            tls_config.clone(),
+            cert_der.clone(),
+            "example.com",
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            move |mut socket| {
+                let head = read_http_head(&mut socket, 16 * 1024)?;
+                let handled = handle_host_ip_white_auth(
+                    &auth_registry,
+                    &auth_route,
+                    "203.0.113.21:7890",
+                    &head,
+                    &mut socket,
+                    8443,
+                )?;
+                assert!(handled);
+                Ok(())
+            },
+        );
+        let auth_text = String::from_utf8(auth_response).unwrap();
+        assert!(auth_text.starts_with("HTTP/1.1 401 Unauthorized\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "));
+        assert!(auth_text.contains("<title>NPS访问验证</title>"));
+        assert!(auth_text.contains("203.0.113.21"));
+
+        let basic_auth_response = replay_https(
+            tls_config.clone(),
+            cert_der.clone(),
+            "example.com",
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            |mut socket| write_basic_auth_required(&mut socket),
+        );
+        assert_eq!(
+            String::from_utf8(basic_auth_response).unwrap(),
+            "HTTP/1.1 401 Unauthorized\nContent-Type: text/plain; charset=utf-8\nWWW-Authenticate: Basic realm=\"easyProxy\"\n\n401 Unauthorized"
+        );
+
+        let not_found_response = replay_https(
+            tls_config,
+            cert_der,
+            "example.com",
+            b"GET /missing HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            {
+                let registry = Arc::clone(&registry);
+                move |mut socket| write_custom_404(&mut socket, &registry)
+            },
+        );
+        let not_found_text = String::from_utf8(not_found_response).unwrap();
+        assert!(not_found_text.starts_with("HTTP/1.1 404 Not Found\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: "));
+        assert!(
+            not_found_text.contains("<title>nps error</title>")
+                || not_found_text.contains("404 not found")
+                || not_found_text.contains("nps 404")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn install_test_client(registry: &Arc<Registry>, id: u64, vkey: &str, no_store: bool) {
         let mut client = ClientRuntimeConfig::default();
         client.id = id;
@@ -4403,6 +4962,100 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         false
+    }
+
+    fn replay_http<F>(request: &[u8], handler: F) -> Vec<u8>
+    where
+        F: FnOnce(TcpStream) -> io::Result<()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            handler(socket).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request).unwrap();
+        let response = read_replay_bytes(&mut client);
+        server.join().unwrap();
+        response
+    }
+
+    fn replay_https<F>(
+        server_config: StdArc<rustls::ServerConfig>,
+        cert_der: CertificateDer<'static>,
+        server_name: &str,
+        request: &[u8],
+        handler: F,
+    ) -> Vec<u8>
+    where
+        F: FnOnce(&mut rustls::StreamOwned<rustls::ServerConnection, TcpStream>) -> io::Result<()>
+            + Send
+            + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut tls = tls_handshake(socket, server_config).unwrap();
+            handler(&mut tls).unwrap();
+            tls.conn.send_close_notify();
+            tls.flush().unwrap();
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from(server_name.to_string()).unwrap();
+        let conn = ClientConnection::new(StdArc::new(client_config), name).unwrap();
+        let socket = TcpStream::connect(addr).unwrap();
+        let mut client = StreamOwned::new(conn, socket);
+        client.write_all(request).unwrap();
+        client.flush().unwrap();
+        let response = read_replay_bytes(&mut client);
+        server.join().unwrap();
+        response
+    }
+
+    fn write_test_page_assets(root: &std::path::Path) {
+        let page_dir = root.join("web").join("static").join("page");
+        fs::create_dir_all(&page_dir).unwrap();
+        fs::write(
+            page_dir.join("error.html"),
+            "<!DOCTYPE html><html><head><title>nps error</title></head><body>404 not found,power by <a href=\"//ehang.io/nps\">nps</a></body></html>",
+        )
+        .unwrap();
+        fs::write(
+            page_dir.join("auth.html"),
+            "<!DOCTYPE html><html><head><title>NPS访问验证</title></head><body><div>${ip}</div><script>function submitAuth(){var pwd='';const xhr=new XMLHttpRequest();xhr.open(\"post\", \"/authIp?pass=\" + pwd)}</script></body></html>",
+        )
+        .unwrap();
+    }
+
+    fn read_replay_bytes(stream: &mut impl Read) -> Vec<u8> {
+        let mut response = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&buf[..n]),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    break;
+                }
+                Err(err) => panic!("unexpected replay read error: {err}"),
+            }
+        }
+        response
     }
 
     fn wait_until_port_closed(port: u16) -> bool {

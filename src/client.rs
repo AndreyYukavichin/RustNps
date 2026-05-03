@@ -6,12 +6,13 @@ use crate::protocol::{
     ServerMessage,
 };
 use crate::relay::{
-    copy_bidirectional, read_http_head, wrap_client_transport, write_http_response, RelayStream,
+    copy_bidirectional, http_header_value, parse_http_request_line, read_http_head,
+    wrap_client_transport, write_http_response, RelayStream,
 };
 use crate::{CORE_VERSION, VERSION};
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -266,7 +267,9 @@ fn control_loop(config: ClientRuntimeConfig) -> io::Result<()> {
         "Successful connection with server {}",
         config.common.server_addr
     );
-    if let Err(err) = ensure_mux_session(&config, &mux_session) {
+    if mux_disabled() {
+        crate::log_warn!("npc", "mux disabled by RUSTNPS_DISABLE_MUX, fallback to raw data links");
+    } else if let Err(err) = ensure_mux_session(&config, &mux_session) {
         crate::log_warn!("npc", "mux session unavailable, fallback to raw data links: {err}");
     }
 
@@ -274,6 +277,14 @@ fn control_loop(config: ClientRuntimeConfig) -> io::Result<()> {
         let msg: ServerMessage = read_message(&mut stream)?;
         match msg {
             ServerMessage::Open { link_id, link } => {
+                crate::log_debug!(
+                    "npc",
+                    "control received open link_id={} kind={:?} target={} remote={}",
+                    link_id,
+                    link.kind,
+                    link.target,
+                    link.remote_addr
+                );
                 let config = config.clone();
                 let mux_session = Arc::clone(&mux_session);
                 thread::spawn(move || {
@@ -328,9 +339,18 @@ fn handle_open(
     link_id: u64,
     link: Link,
 ) -> io::Result<()> {
+    crate::log_debug!(
+        "npc",
+        "handle open begin link_id={} kind={:?} target={} remote={} mux_disabled={}",
+        link_id,
+        link.kind,
+        link.target,
+        link.remote_addr,
+        mux_disabled()
+    );
     match link.kind {
         LinkKind::Tcp | LinkKind::Secret | LinkKind::P2p => {
-            crate::log_info!(
+            crate::log_trace!(
                 "npc",
                 "new tcp connection with the goal of {}, remote address:{}",
                 link.target,
@@ -338,15 +358,15 @@ fn handle_open(
             );
         }
         LinkKind::Udp => {
-            crate::log_info!(
+            crate::log_trace!(
                 "npc",
-                "new udp connection with the goal of {}, remote address:{}",
+                "new udp5 connection with the goal of {}, remote address:{}",
                 link.target,
                 link.remote_addr
             );
         }
         LinkKind::Http => {
-            crate::log_info!(
+            crate::log_trace!(
                 "npc",
                 "http request, remote address:{}, target:{}",
                 link.remote_addr,
@@ -356,17 +376,39 @@ fn handle_open(
         LinkKind::File => {}
     }
     if let Ok(stream) = open_mux_stream(&config, &mux_session, link_id) {
+        crate::log_debug!("npc", "handle open mux stream ready link_id={}", link_id);
         return serve_link(Box::new(stream), link);
     }
+
+    crate::log_debug!(
+        "npc",
+        "handle open falling back to raw data link link_id={} server={}",
+        link_id,
+        config.common.server_addr
+    );
 
     let mut stream = TcpStream::connect(&config.common.server_addr)?;
     let hello = BridgeHello::Data {
         vkey: config.common.vkey.clone(),
         link_id,
     };
+    crate::log_debug!(
+        "npc",
+        "handle open sending data hello link_id={} vkey={}",
+        link_id,
+        config.common.vkey
+    );
     write_message(&mut stream, &hello)?;
     match read_message::<ServerMessage>(&mut stream)? {
-        ServerMessage::Ok { .. } => serve_link(Box::new(stream), link),
+        ServerMessage::Ok { message } => {
+            crate::log_debug!(
+                "npc",
+                "handle open data accepted link_id={} message={}",
+                link_id,
+                message
+            );
+            serve_link(Box::new(stream), link)
+        }
         ServerMessage::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -381,7 +423,32 @@ fn serve_link(stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
     match link.kind {
         LinkKind::Udp => serve_udp(stream, link),
         LinkKind::File => serve_file(stream, link),
-        LinkKind::Tcp | LinkKind::Http | LinkKind::Secret | LinkKind::P2p => {
+        LinkKind::Http => {
+            let mut stream = stream;
+            let head = read_http_head(&mut stream, 64 * 1024)?;
+            if let Some((method, path, _)) = parse_http_request_line(&head) {
+                let host = http_header_value(&head, "Host").unwrap_or_default();
+                crate::log_trace!(
+                    "npc",
+                    "http request, method {}, host {}, url {}, remote address {}",
+                    method,
+                    host,
+                    path,
+                    link.remote_addr
+                );
+            }
+            let mut target = match TcpStream::connect(&target_addr) {
+                Ok(t) => t,
+                Err(err) => {
+                    crate::log_info!("npc", "new connect error ,the target {} refuse to connect", target_addr);
+                    crate::log_error!("npc", "Accept server data error read tcp ->{}: {}, end this service", target_addr, err);
+                    return Err(err);
+                }
+            };
+            target.write_all(&head)?;
+            copy_bidirectional(stream, target)
+        }
+        LinkKind::Tcp | LinkKind::Secret | LinkKind::P2p => {
             let target = match TcpStream::connect(&target_addr) {
                 Ok(t) => t,
                 Err(err) => {
@@ -412,11 +479,26 @@ fn serve_udp(mut stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
             {
                 return Ok(());
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                crate::log_error!("npc", "read udp data from server error {}", err);
+                return Err(err);
+            }
         };
-        socket.send_to(&packet, &link.target)?;
-        let (n, _) = socket.recv_from(&mut buf)?;
-        write_blob(&mut stream, &buf[..n])?;
+        if let Err(err) = socket.send_to(&packet, &link.target) {
+            crate::log_error!("npc", "write data to remote {} error {}", link.target, err);
+            return Err(err);
+        }
+        let (n, _) = match socket.recv_from(&mut buf) {
+            Ok(result) => result,
+            Err(err) => {
+                crate::log_error!("npc", "read data from remote server error {}", err);
+                return Err(err);
+            }
+        };
+        if let Err(err) = write_blob(&mut stream, &buf[..n]) {
+            crate::log_error!("npc", "write data to remote  error {}", err);
+            return Err(err);
+        }
     }
 }
 
@@ -529,6 +611,12 @@ fn ensure_mux_session(
     config: &ClientRuntimeConfig,
     holder: &Arc<Mutex<Option<Arc<MuxSession>>>>,
 ) -> io::Result<Arc<MuxSession>> {
+    if mux_disabled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "mux disabled by RUSTNPS_DISABLE_MUX",
+        ));
+    }
     if let Some(session) = holder.lock().unwrap().as_ref().cloned() {
         if !session.is_closed() {
             return Ok(session);
@@ -553,6 +641,16 @@ fn ensure_mux_session(
             format!("unexpected mux response: {other:?}"),
         )),
     }
+}
+
+fn mux_disabled() -> bool {
+    matches!(
+        std::env::var("RUSTNPS_DISABLE_MUX")
+            .ok()
+            .as_deref()
+            .map(|value| value.trim().to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "yes" | "on")
+    )
 }
 
 fn open_mux_stream(
