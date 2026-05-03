@@ -1,11 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::model::FlowCounter;
 use crate::relay::{RelayRead, RelayStream, RelayWrite};
@@ -33,6 +33,7 @@ struct MuxSessionInner {
     streams: Mutex<HashMap<u64, Sender<Option<Vec<u8>>>>>,
     accept_tx: Sender<MuxStream>,
     closed: AtomicBool,
+    last_activity: AtomicU64,
     traffic: Option<MuxTrafficState>,
 }
 
@@ -71,12 +72,17 @@ impl MuxSession {
                 streams: Mutex::new(HashMap::new()),
                 accept_tx,
                 closed: AtomicBool::new(false),
+                last_activity: AtomicU64::new(
+                    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                ),
                 traffic,
             }),
             accept_rx: Mutex::new(accept_rx),
         });
         let weak = Arc::downgrade(&session.inner);
+        let weak_ping = Arc::downgrade(&session.inner);
         thread::spawn(move || read_loop(reader, weak));
+        thread::spawn(move || ping_loop(weak_ping));
         Ok(session)
     }
 
@@ -390,9 +396,27 @@ impl Drop for MuxStream {
 }
 
 fn read_loop(mut reader: TcpStream, session: Weak<MuxSessionInner>) {
+    let local_addr = reader.local_addr().map(|a| a.to_string()).unwrap_or_default();
+    let peer_addr = reader.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+
     loop {
         let mut header = [0_u8; HEADER_LEN];
-        if reader.read_exact(&mut header).is_err() {
+        if let Err(err) = reader.read_exact(&mut header) {
+            if err.kind() == io::ErrorKind::UnexpectedEof {
+                crate::log_debug!("npc", "mux: read session unpack from connection err EOF");
+            } else if err.kind() == io::ErrorKind::TimedOut || err.kind() == io::ErrorKind::WouldBlock {
+                crate::log_debug!(
+                    "npc",
+                    "mux: read session unpack from connection err read tcp {}->{}: read: connection timed out",
+                    local_addr, peer_addr
+                );
+            } else {
+                crate::log_debug!(
+                    "npc",
+                    "mux: read session unpack from connection err read tcp {}->{}: {}",
+                    local_addr, peer_addr, err
+                );
+            }
             break;
         }
         let kind = header[0];
@@ -403,15 +427,37 @@ fn read_loop(mut reader: TcpStream, session: Weak<MuxSessionInner>) {
         len_buf.copy_from_slice(&header[9..13]);
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > MAX_FRAME {
+            crate::log_error!("npc", "mux: frame too large");
             break;
         }
         let mut payload = vec![0_u8; len];
-        if len > 0 && reader.read_exact(&mut payload).is_err() {
-            break;
+        if len > 0 {
+            if let Err(err) = reader.read_exact(&mut payload) {
+                if err.kind() == io::ErrorKind::UnexpectedEof {
+                    crate::log_debug!("npc", "mux: read session unpack from connection err EOF");
+                } else if err.kind() == io::ErrorKind::TimedOut || err.kind() == io::ErrorKind::WouldBlock {
+                    crate::log_debug!(
+                        "npc",
+                        "mux: read session unpack from connection err read tcp {}->{}: read: connection timed out",
+                        local_addr, peer_addr
+                    );
+                } else {
+                    crate::log_debug!(
+                        "npc",
+                        "mux: read session unpack from connection err read tcp {}->{}: {}",
+                        local_addr, peer_addr, err
+                    );
+                }
+                break;
+            }
         }
         let Some(session) = session.upgrade() else {
             break;
         };
+        session.last_activity.store(
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            Ordering::Relaxed,
+        );
         if kind == FRAME_DATA {
             if session.record_export(payload.len() as u64).is_err() {
                 session.close_session();
@@ -440,8 +486,46 @@ fn read_loop(mut reader: TcpStream, session: Weak<MuxSessionInner>) {
             _ => break,
         }
     }
+    crate::log_debug!("npc", "close mux");
     if let Some(session) = session.upgrade() {
         session.close_session();
+    }
+}
+
+fn ping_loop(session_weak: Weak<MuxSessionInner>) {
+    let mut checktime = 0;
+    let threshold = 60;
+    loop {
+        thread::sleep(Duration::from_secs(5));
+        let Some(session) = session_weak.upgrade() else {
+            break;
+        };
+        if session.closed.load(Ordering::SeqCst) {
+            break;
+        }
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let last = session.last_activity.load(Ordering::Relaxed);
+        
+        if now.saturating_sub(last) < 5 {
+            checktime = 0;
+        } else {
+            checktime += 1;
+        }
+        
+        if checktime > threshold {
+            crate::log_debug!(
+                "npc",
+                "mux: ping time out, checktime {} threshold {}",
+                checktime,
+                threshold
+            );
+            session.close_session();
+            break;
+        }
     }
 }
 

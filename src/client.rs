@@ -152,11 +152,11 @@ fn control_loop_with_reconnect(config: ClientRuntimeConfig) -> io::Result<()> {
                     crate::log_error!("npc", "The connection server failed, error {err}");
                     return Err(err);
                 }
-                crate::log_error!(
+                crate::log_info!("npc", "accpet error,the conn has closed");
+                crate::log_info!(
                     "npc",
-                    "The connection server failed and will be reconnected in five seconds, error {err}"
+                    "Client closed! It will be reconnected in five seconds"
                 );
-                crate::log_info!("npc", "Reconnecting...");
                 thread::sleep(Duration::from_secs(5));
             }
         }
@@ -213,6 +213,7 @@ fn control_loop(config: ClientRuntimeConfig) -> io::Result<()> {
     match read_message::<ServerMessage>(&mut stream)? {
         ServerMessage::Ok { .. } => {}
         ServerMessage::Error { message } => {
+            crate::log_error!("npc", "{}", message);
             return Err(classify_server_error(message))
         }
         other => {
@@ -222,6 +223,10 @@ fn control_loop(config: ClientRuntimeConfig) -> io::Result<()> {
             ))
         }
     }
+    crate::log_info!(
+        "npc",
+        "start vkey:{}", config.common.vkey
+    );
     crate::log_info!(
         "npc",
         "Successful connection with server {}",
@@ -310,12 +315,19 @@ fn handle_open(
 }
 
 fn serve_link(stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
+    let target_addr = link.target.clone();
     let stream = wrap_client_transport(stream, link.crypt, link.compress)?;
     match link.kind {
         LinkKind::Udp => serve_udp(stream, link),
         LinkKind::File => serve_file(stream, link),
         LinkKind::Tcp | LinkKind::Http | LinkKind::Secret | LinkKind::P2p => {
-            let target = TcpStream::connect(&link.target)?;
+            let target = match TcpStream::connect(&target_addr) {
+                Ok(t) => t,
+                Err(err) => {
+                    crate::log_error!("npc", "Accept server data error read tcp ->{}: {}, end this service", target_addr, err);
+                    return Err(err);
+                }
+            };
             copy_bidirectional(stream, target)
         }
     }
