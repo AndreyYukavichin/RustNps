@@ -322,13 +322,28 @@ fn serve_link(stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
 }
 
 fn serve_udp(mut stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
-    let packet = read_blob(&mut stream)?;
     let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.set_read_timeout(Some(Duration::from_secs(10)))?;
-    socket.send_to(&packet, &link.target)?;
+    socket.set_read_timeout(Some(Duration::from_secs(60)))?;
     let mut buf = vec![0_u8; 64 * 1024];
-    let (n, _) = socket.recv_from(&mut buf)?;
-    write_blob(&mut stream, &buf[..n])
+    loop {
+        let packet = match read_blob(&mut stream) {
+            Ok(packet) => packet,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
+        socket.send_to(&packet, &link.target)?;
+        let (n, _) = socket.recv_from(&mut buf)?;
+        write_blob(&mut stream, &buf[..n])?;
+    }
 }
 
 fn serve_file(mut stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {

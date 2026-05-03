@@ -23,10 +23,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{Shutdown, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime};
@@ -123,6 +123,7 @@ pub struct Registry {
     pub controls: Mutex<HashMap<String, ControlHandle>>,
     pub mux_sessions: Mutex<HashMap<String, Arc<MuxSession>>>,
     listener_shutdowns: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    tunnel_live_conns: Mutex<HashMap<u64, HashMap<u64, TcpStream>>>,
     pub pending: Mutex<HashMap<u64, Sender<Box<dyn RelayStream>>>>,
     pub clients: Mutex<HashMap<String, ClientRuntimeConfig>>,
     pub secrets: Mutex<HashMap<String, Tunnel>>,
@@ -147,6 +148,7 @@ impl Registry {
             controls: Mutex::new(HashMap::new()),
             mux_sessions: Mutex::new(HashMap::new()),
             listener_shutdowns: Mutex::new(HashMap::new()),
+            tunnel_live_conns: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
             secrets: Mutex::new(HashMap::new()),
@@ -819,6 +821,7 @@ fn stop_tunnel_runtime(registry: &Arc<Registry>, tunnel: &Tunnel) {
     {
         flag.store(true, Ordering::SeqCst);
     }
+    disconnect_tunnel_live_conns(registry, tunnel.id);
     if let Some(key) = listener_key(tunnel) {
         for _ in 0..20 {
             if !registry.listeners.lock().unwrap().contains(&key) {
@@ -832,6 +835,70 @@ fn stop_tunnel_runtime(registry: &Arc<Registry>, tunnel: &Tunnel) {
 fn stop_tunnel_runtimes(registry: &Arc<Registry>, tunnels: &[Tunnel]) {
     for tunnel in tunnels {
         stop_tunnel_runtime(registry, tunnel);
+    }
+}
+
+fn register_tunnel_live_conn(
+    registry: &Arc<Registry>,
+    tunnel_id: u64,
+    stream: &TcpStream,
+) -> Option<u64> {
+    let cloned = stream.try_clone().ok()?;
+    let conn_id = registry.next_link_id();
+    registry
+        .tunnel_live_conns
+        .lock()
+        .unwrap()
+        .entry(tunnel_id)
+        .or_default()
+        .insert(conn_id, cloned);
+    Some(conn_id)
+}
+
+fn unregister_tunnel_live_conn(registry: &Arc<Registry>, tunnel_id: u64, conn_id: Option<u64>) {
+    let Some(conn_id) = conn_id else {
+        return;
+    };
+    let mut all = registry.tunnel_live_conns.lock().unwrap();
+    if let Some(group) = all.get_mut(&tunnel_id) {
+        group.remove(&conn_id);
+        if group.is_empty() {
+            all.remove(&tunnel_id);
+        }
+    }
+}
+
+fn disconnect_tunnel_live_conns(registry: &Arc<Registry>, tunnel_id: u64) {
+    let conns = registry
+        .tunnel_live_conns
+        .lock()
+        .unwrap()
+        .remove(&tunnel_id)
+        .unwrap_or_default();
+    for (_, stream) in conns {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+struct TunnelConnGuard {
+    registry: Arc<Registry>,
+    tunnel_id: u64,
+    conn_id: Option<u64>,
+}
+
+impl TunnelConnGuard {
+    fn new(registry: Arc<Registry>, tunnel_id: u64, conn_id: Option<u64>) -> Self {
+        Self {
+            registry,
+            tunnel_id,
+            conn_id,
+        }
+    }
+}
+
+impl Drop for TunnelConnGuard {
+    fn drop(&mut self) {
+        unregister_tunnel_live_conn(&self.registry, self.tunnel_id, self.conn_id);
     }
 }
 
@@ -921,7 +988,9 @@ fn start_tcp_listener(
         let registry = Arc::clone(&registry);
         let tunnel = tunnel.clone();
         let cursor_key = cursor_key.clone();
+        let tracked_conn_id = register_tunnel_live_conn(&registry, tunnel.id, &inbound);
         thread::spawn(move || {
+            let _conn_guard = TunnelConnGuard::new(Arc::clone(&registry), tunnel.id, tracked_conn_id);
             if !tunnel_is_active(&registry, tunnel.id) {
                 return;
             }
@@ -1008,7 +1077,9 @@ fn start_http_proxy_listener(
         };
         let registry = Arc::clone(&registry);
         let tunnel = tunnel.clone();
+        let tracked_conn_id = register_tunnel_live_conn(&registry, tunnel.id, &inbound);
         thread::spawn(move || {
+            let _conn_guard = TunnelConnGuard::new(Arc::clone(&registry), tunnel.id, tracked_conn_id);
             if !tunnel_is_active(&registry, tunnel.id) {
                 return;
             }
@@ -1092,7 +1163,9 @@ fn start_socks5_listener(
         };
         let registry = Arc::clone(&registry);
         let tunnel = tunnel.clone();
+        let tracked_conn_id = register_tunnel_live_conn(&registry, tunnel.id, &inbound);
         thread::spawn(move || {
+            let _conn_guard = TunnelConnGuard::new(Arc::clone(&registry), tunnel.id, tracked_conn_id);
             if !tunnel_is_active(&registry, tunnel.id) {
                 return;
             }
@@ -1145,6 +1218,7 @@ fn start_udp_listener(
     );
     crate::log_debug!("nps", "udp tunnel {} listening on {addr}", tunnel.remark);
     let cursor_key = format!("{}:{}", tunnel.client_vkey, tunnel.remark);
+    let workers: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut buf = vec![0_u8; 64 * 1024];
 
     loop {
@@ -1164,12 +1238,31 @@ fn start_udp_listener(
             Err(err) => return Err(err),
         };
         let packet = buf[..n].to_vec();
+        let peer_key = peer.to_string();
+        if let Some(tx) = workers.lock().unwrap().get(&peer_key).cloned() {
+            let _ = tx.send(packet);
+            continue;
+        }
+
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let _ = tx.send(packet);
+        workers
+            .lock()
+            .unwrap()
+            .insert(peer_key.clone(), tx.clone());
+
         let registry = Arc::clone(&registry);
         let tunnel = tunnel.clone();
         let socket = Arc::clone(&socket);
         let cursor_key = cursor_key.clone();
+        let workers = Arc::clone(&workers);
+        let shutdown = Arc::clone(&shutdown);
         thread::spawn(move || {
-            if !tunnel_is_active(&registry, tunnel.id) {
+            let _cleanup = UdpWorkerCleanup {
+                workers,
+                key: peer_key.clone(),
+            };
+            if shutdown.load(Ordering::SeqCst) || !tunnel_is_active(&registry, tunnel.id) {
                 return;
             }
             let Some(target) = select_target(&registry, &cursor_key, &tunnel) else {
@@ -1188,9 +1281,24 @@ fn start_udp_listener(
             };
             match request_client_stream(&registry, &tunnel.client_vkey, link) {
                 Ok(mut client_stream) => {
-                    if write_blob(&mut client_stream, &packet).is_ok() {
-                        if let Ok(reply) = read_blob(&mut client_stream) {
-                            let _ = socket.send_to(&reply, peer);
+                    loop {
+                        if shutdown.load(Ordering::SeqCst) || !tunnel_is_active(&registry, tunnel.id)
+                        {
+                            break;
+                        }
+                        let packet = match rx.recv_timeout(Duration::from_millis(200)) {
+                            Ok(packet) => packet,
+                            Err(RecvTimeoutError::Timeout) => continue,
+                            Err(RecvTimeoutError::Disconnected) => break,
+                        };
+                        if write_blob(&mut client_stream, &packet).is_err() {
+                            break;
+                        }
+                        match read_blob(&mut client_stream) {
+                            Ok(reply) => {
+                                let _ = socket.send_to(&reply, peer);
+                            }
+                            Err(_) => break,
                         }
                     }
                 }
@@ -1198,7 +1306,19 @@ fn start_udp_listener(
             }
         });
     }
+    workers.lock().unwrap().clear();
     Ok(())
+}
+
+struct UdpWorkerCleanup {
+    workers: Arc<Mutex<HashMap<String, Sender<Vec<u8>>>>>,
+    key: String,
+}
+
+impl Drop for UdpWorkerCleanup {
+    fn drop(&mut self) {
+        self.workers.lock().unwrap().remove(&self.key);
+    }
 }
 
 fn start_http_host_listener(registry: Arc<Registry>) -> io::Result<()> {
@@ -3620,6 +3740,7 @@ service manager."#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 
@@ -3894,6 +4015,44 @@ mod tests {
         let delete = HashMap::from([("id".to_string(), tunnel_id.to_string())]);
         assert!(mutate_tunnel_delete(&registry, &delete).contains("delete success"));
         assert!(wait_until_port_closed(new_port));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stopping_tunnel_disconnects_tracked_live_connections() {
+        let root = temp_test_dir("rustnps-stop-disconnect-live");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut client_side = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let server_side = listener.accept().unwrap().0;
+
+        let tunnel = Tunnel {
+            id: 9090,
+            mode: "tcp".to_string(),
+            server_ip: "127.0.0.1".to_string(),
+            server_port: port,
+            ..Tunnel::default()
+        };
+        let conn_id = register_tunnel_live_conn(&registry, tunnel.id, &server_side);
+        assert!(conn_id.is_some());
+
+        stop_tunnel_runtime(&registry, &tunnel);
+
+        client_side
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let _ = client_side.write_all(b"x");
+        let mut buf = [0_u8; 8];
+        let read = client_side.read(&mut buf);
+        assert!(matches!(read, Ok(0) | Err(_)));
+        assert!(!registry
+            .tunnel_live_conns
+            .lock()
+            .unwrap()
+            .contains_key(&tunnel.id));
 
         let _ = fs::remove_dir_all(root);
     }
