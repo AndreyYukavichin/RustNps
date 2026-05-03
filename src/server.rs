@@ -10,9 +10,9 @@ use crate::protocol::{
 };
 use crate::relay::{
     check_http_basic_auth, copy_bidirectional, copy_bidirectional_legacy, md5_hex,
-    parse_http_host_path, parse_http_request_line, parse_http_status_code, parse_http_target,
-    read_http_head, rewrite_http_request_head, wrap_server_transport, write_http_response,
-    RelayPolicy, RelayRead, RelayStream, RelayWrite,
+    http_header_value, parse_http_host_path, parse_http_request_line, parse_http_status_code,
+    parse_http_target, read_http_head, rewrite_http_request_head, wrap_server_transport,
+    write_http_response, RelayPolicy, RelayRead, RelayStream, RelayWrite,
 };
 use crate::socks5::accept_socks5;
 use crate::store::{PersistentState, PersistentStore};
@@ -412,6 +412,9 @@ pub fn run_with_store(config: ServerConfig, store: PersistentStore) -> io::Resul
         "the version of server is {VERSION} ,allow client core version to be {CORE_VERSION},tls enable is {}",
         config.tls_enable
     );
+    if !config.log_path.is_empty() {
+        crate::log_info!("nps", "log path is {}", config.log_path);
+    }
     let registry = Arc::new(Registry::new(config.clone(), store));
     load_persistent_state(&registry)?;
 
@@ -495,9 +498,18 @@ fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Res
                 write_message(&mut stream, &error(err.to_string()))?;
                 return Ok(());
             }
+            let client_id = registry.clients.lock().unwrap().get(&vkey).map(|c| c.id).unwrap_or(0);
             crate::log_info!(
                 "nps",
-                "client {vkey} connection succeeded, address:{remote_addr}, version={version}, core={core_version}"
+                "clientId {} connection succeeded, address:{} ",
+                client_id, remote_addr
+            );
+            crate::log_debug!(
+                "nps",
+                "client {} online, version={}, core={}",
+                vkey,
+                version,
+                core_version
             );
             write_message(&mut stream, &ok("control accepted"))?;
             let (tx, rx) = mpsc::channel::<ServerMessage>();
@@ -530,9 +542,18 @@ fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Res
                 write_message(&mut stream, &error(err.to_string()))?;
                 return Ok(());
             }
+            let client_id = registry.clients.lock().unwrap().get(&vkey).map(|c| c.id).unwrap_or(0);
             crate::log_info!(
                 "nps",
-                "client mux from {vkey}, address:{remote_addr}, version={version}, core={core_version}"
+                "clientId {} connection succeeded, address:{} ",
+                client_id, remote_addr
+            );
+            crate::log_debug!(
+                "nps",
+                "client {} mux online, version={}, core={}",
+                vkey,
+                version,
+                core_version
             );
             write_message(&mut stream, &ok("mux accepted"))?;
             let session = MuxSession::new_with_policy(
@@ -581,9 +602,18 @@ fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Res
                 write_message(&mut stream, &error(err.to_string()))?;
                 return Ok(());
             }
+            let client_id = config.id.max(registry.clients.lock().unwrap().get(&vkey).map(|c| c.id).unwrap_or(0));
             crate::log_info!(
                 "nps",
-                "client config from {vkey}, address:{remote_addr}, version={version}, core={core_version}"
+                "clientId {} connection succeeded, address:{} ",
+                client_id, remote_addr
+            );
+            crate::log_debug!(
+                "nps",
+                "client {} config online, version={}, core={}",
+                vkey,
+                version,
+                core_version
             );
             if config.common.vkey.is_empty() {
                 config.common.vkey = vkey.clone();
@@ -725,7 +755,20 @@ fn start_tunnel_task(registry: Arc<Registry>, tunnel: Tunnel) {
         return;
     }
     if let Err(err) = validate_tunnel_ports(&registry.server, &tunnel) {
-        crate::log_warn!("nps", "skip tunnel {}: {err}", tunnel.remark);
+        let client_id = registry
+            .clients
+            .lock()
+            .unwrap()
+            .get(&tunnel.client_vkey)
+            .map(|client| client.id)
+            .unwrap_or(0);
+        crate::log_error!(
+            "nps",
+            "clientId {} taskId {} start error {}",
+            client_id,
+            tunnel.id,
+            err
+        );
         return;
     }
     let mode = tunnel.mode.to_ascii_lowercase();
@@ -741,7 +784,7 @@ fn start_tunnel_task(registry: Arc<Registry>, tunnel: Tunnel) {
                 .lock()
                 .unwrap()
                 .insert(md5_hex(&tunnel.password), tunnel.clone());
-            crate::log_info!("nps", "secret task {} start mode:{mode}", tunnel.remark);
+            crate::log_info!("nps", "secret task {} start ", tunnel.remark);
         }
         return;
     }
@@ -768,9 +811,16 @@ fn start_tunnel_task(registry: Arc<Registry>, tunnel: Tunnel) {
         .insert(tunnel.id, Arc::clone(&shutdown));
 
     thread::spawn(move || {
-        let remark = tunnel.remark.clone();
         let tunnel_id = tunnel.id;
+        let port = tunnel.server_port;
         let registry_for_cleanup = Arc::clone(&registry);
+        let client_id = registry_for_cleanup
+            .clients
+            .lock()
+            .unwrap()
+            .get(&tunnel.client_vkey)
+            .map(|client| client.id)
+            .unwrap_or(0);
         let result = match mode.as_str() {
             "tcp" | "tcptrans" | "file" => start_tcp_listener(registry, tunnel, shutdown),
             "httpproxy" => start_http_proxy_listener(registry, tunnel, shutdown),
@@ -786,7 +836,14 @@ fn start_tunnel_task(registry: Arc<Registry>, tunnel: Tunnel) {
             }
         };
         if let Err(err) = result {
-            crate::log_error!("nps", "tunnel {remark} stopped: {err}");
+            if matches!(
+                err.kind(),
+                io::ErrorKind::AddrInUse | io::ErrorKind::AddrNotAvailable | io::ErrorKind::PermissionDenied
+            ) {
+                crate::log_error!("nps", "taskId {} start error port {} open failed", tunnel_id, port);
+            } else {
+                crate::log_error!("nps", "clientId {} taskId {} start error {}", client_id, tunnel_id, err);
+            }
         }
         registry_for_cleanup
             .listeners
@@ -813,6 +870,7 @@ fn start_active_tunnels_for_client(registry: &Arc<Registry>, config: &ClientRunt
 }
 
 fn stop_tunnel_runtime(registry: &Arc<Registry>, tunnel: &Tunnel) {
+    crate::log_info!("nps", "stop server id {}", tunnel.id);
     if let Some(flag) = registry
         .listener_shutdowns
         .lock()
@@ -830,6 +888,21 @@ fn stop_tunnel_runtime(registry: &Arc<Registry>, tunnel: &Tunnel) {
             thread::sleep(Duration::from_millis(50));
         }
     }
+    let client_id = registry
+        .clients
+        .lock()
+        .unwrap()
+        .get(&tunnel.client_vkey)
+        .map(|client| client.id)
+        .unwrap_or(0);
+    crate::log_info!(
+        "nps",
+        "close port {},remark {},client id {},task id {}",
+        tunnel.server_port,
+        tunnel.remark,
+        client_id,
+        tunnel.id
+    );
 }
 
 fn stop_tunnel_runtimes(registry: &Arc<Registry>, tunnels: &[Tunnel]) {
@@ -953,7 +1026,10 @@ fn start_tcp_listener(
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let addr = bind_addr(&tunnel);
-    let listener = TcpListener::bind(&addr)?;
+    let listener = TcpListener::bind(&addr).map_err(|err| {
+        crate::log_error!("nps", "taskId {} start error port {} open failed", tunnel.id, tunnel.server_port);
+        err
+    })?;
     listener.set_nonblocking(true)?;
     crate::log_info!(
         "nps",
@@ -998,6 +1074,13 @@ fn start_tcp_listener(
                 .peer_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_default();
+            crate::log_info!(
+                "nps",
+                "new tcp connection, local port {}, client {}, remote address {}",
+                tunnel.server_port,
+                tunnel.client_vkey,
+                remote
+            );
             let Some(target) = select_target(&registry, &cursor_key, &tunnel) else {
                 let _ = write_http_response(
                     &mut inbound,
@@ -1051,7 +1134,10 @@ fn start_http_proxy_listener(
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let addr = bind_addr(&tunnel);
-    let listener = TcpListener::bind(&addr)?;
+    let listener = TcpListener::bind(&addr).map_err(|err| {
+        crate::log_error!("nps", "taskId {} start error port {} open failed", tunnel.id, tunnel.server_port);
+        err
+    })?;
     listener.set_nonblocking(true)?;
     crate::log_info!(
         "nps",
@@ -1103,6 +1189,18 @@ fn start_http_proxy_listener(
                 );
                 return;
             };
+            if let Some((method, path, _)) = parse_http_request_line(&head) {
+                let host = http_header_value(&head, "Host").unwrap_or_else(|| target.clone());
+                crate::log_info!(
+                    "nps",
+                    "http request, method {}, host {}, url {}, remote address {}, target {}",
+                    method,
+                    host,
+                    path,
+                    remote,
+                    target
+                );
+            }
             if is_connect {
                 let _ = inbound.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
             }
@@ -1137,7 +1235,10 @@ fn start_socks5_listener(
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let addr = bind_addr(&tunnel);
-    let listener = TcpListener::bind(&addr)?;
+    let listener = TcpListener::bind(&addr).map_err(|err| {
+        crate::log_error!("nps", "taskId {} start error port {} open failed", tunnel.id, tunnel.server_port);
+        err
+    })?;
     listener.set_nonblocking(true)?;
     crate::log_info!(
         "nps",
@@ -1173,10 +1274,37 @@ fn start_socks5_listener(
                 .peer_addr()
                 .map(|a| a.to_string())
                 .unwrap_or_default();
+            let client_id = registry
+                .clients
+                .lock()
+                .unwrap()
+                .get(&tunnel.client_vkey)
+                .map(|client| client.id)
+                .unwrap_or(0);
+            crate::log_trace!(
+                "nps",
+                "New socks5 connection,client {},remote address {}",
+                client_id,
+                remote
+            );
             let target = match accept_socks5(&mut inbound) {
                 Ok(target) => target,
                 Err(err) => {
-                    crate::log_warn!("nps", "socks5 handshake failed: {err}");
+                    match err.kind() {
+                        io::ErrorKind::InvalidData => {
+                            if err.to_string().contains("not socks5") {
+                                crate::log_warn!("nps", "only support socks5, request from: {}", remote);
+                            } else {
+                                crate::log_warn!("nps", "wrong method");
+                            }
+                        }
+                        io::ErrorKind::PermissionDenied => {
+                            crate::log_warn!("nps", "Validation failed: {}", err);
+                        }
+                        _ => {
+                            crate::log_warn!("nps", "negotiation err {}", err);
+                        }
+                    }
                     return;
                 }
             };
@@ -1195,7 +1323,15 @@ fn start_socks5_listener(
                 Ok(client_stream) => {
                     let _ = copy_bidirectional(inbound, client_stream);
                 }
-                Err(err) => crate::log_warn!("nps", "socks5 stream failed: {err}"),
+                Err(err) => {
+                    crate::log_warn!(
+                        "nps",
+                        "client id {}, task id {}, error {}, when socks5 connection",
+                        client_id,
+                        tunnel.id,
+                        err
+                    );
+                }
             }
         });
     }
@@ -1208,7 +1344,10 @@ fn start_udp_listener(
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
     let addr = bind_addr(&tunnel);
-    let socket = Arc::new(UdpSocket::bind(&addr)?);
+    let socket = Arc::new(UdpSocket::bind(&addr).map_err(|err| {
+        crate::log_error!("nps", "taskId {} start error port {} open failed", tunnel.id, tunnel.server_port);
+        err
+    })?);
     socket.set_read_timeout(Some(Duration::from_millis(200)))?;
     crate::log_info!(
         "nps",
@@ -1265,6 +1404,19 @@ fn start_udp_listener(
             if shutdown.load(Ordering::SeqCst) || !tunnel_is_active(&registry, tunnel.id) {
                 return;
             }
+            let client_id = registry
+                .clients
+                .lock()
+                .unwrap()
+                .get(&tunnel.client_vkey)
+                .map(|client| client.id)
+                .unwrap_or(0);
+            crate::log_trace!(
+                "nps",
+                "New udp connection,client {},remote address {}",
+                client_id,
+                peer
+            );
             let Some(target) = select_target(&registry, &cursor_key, &tunnel) else {
                 return;
             };
@@ -1302,7 +1454,13 @@ fn start_udp_listener(
                         }
                     }
                 }
-                Err(err) => crate::log_warn!("nps", "udp stream failed: {err}"),
+                Err(err) => crate::log_warn!(
+                    "nps",
+                    "client id {}, task id {},error {}, when udp connection",
+                    client_id,
+                    tunnel.id,
+                    err
+                ),
             }
         });
     }
@@ -1355,6 +1513,7 @@ fn start_http_host_listener(registry: Arc<Registry>) -> io::Result<()> {
                 }
             };
             let Some((host, path)) = parse_http_host_path(&head) else {
+                crate::log_notice!("nps", "the url  {} can't be parsed!", String::from_utf8_lossy(&head));
                 let _ = write_http_response(
                     &mut inbound,
                     "400 Bad Request",
@@ -1385,6 +1544,7 @@ fn start_http_host_listener(registry: Arc<Registry>) -> io::Result<()> {
                     let _ = write_basic_auth_required(&mut inbound);
                 }
                 Err(HostProxyError::InvalidRequest) => {
+                    crate::log_notice!("nps", "the url {} can't be parsed!", host);
                     let _ = write_http_response(
                         &mut inbound,
                         "400 Bad Request",
@@ -1403,7 +1563,10 @@ fn start_https_host_listener(registry: Arc<Registry>) -> io::Result<()> {
         "{}:{}",
         registry.server.http_proxy_ip, registry.server.https_proxy_port
     );
-    let listener = TcpListener::bind(&addr)?;
+    let listener = TcpListener::bind(&addr).map_err(|err| {
+        crate::log_error!("nps", "https listener start error port {} open failed", registry.server.https_proxy_port);
+        err
+    })?;
     crate::log_info!(
         "nps",
         "start https listener, port is {}",
@@ -1437,8 +1600,23 @@ fn handle_https_host_conn(inbound: TcpStream, registry: Arc<Registry>) -> io::Re
 
     if registry.server.https_just_proxy {
         let Some((route, target)) = find_host_route(&registry, &server_name, "/", "https") else {
+            crate::log_notice!("nps", "the url {} can't be parsed!", server_name);
             return Err(io::Error::new(io::ErrorKind::NotFound, "https host route not found"));
         };
+        let client_id = registry
+            .clients
+            .lock()
+            .unwrap()
+            .get(&route.client_vkey)
+            .map(|client| client.id)
+            .unwrap_or(0);
+        crate::log_trace!(
+            "nps",
+            "new https connection,clientId {},host {},remote address {}",
+            client_id,
+            route.host,
+            remote
+        );
         let (crypt, compress) = client_transport_flags(&registry, &route.client_vkey, false);
         let link = Link {
             kind: LinkKind::Tcp,
@@ -1459,6 +1637,7 @@ fn handle_https_host_conn(inbound: TcpStream, registry: Arc<Registry>) -> io::Re
     let mut tls_stream = tls_handshake(inbound, tls_config)?;
     let head = read_http_head(&mut tls_stream, 64 * 1024)?;
     let Some((host, path)) = parse_http_host_path(&head) else {
+        crate::log_notice!("nps", "the url {} can't be parsed!", server_name);
         let _ = write_http_response(
             &mut tls_stream,
             "400 Bad Request",
@@ -1471,6 +1650,20 @@ fn handle_https_host_conn(inbound: TcpStream, registry: Arc<Registry>) -> io::Re
         let _ = write_custom_404(&mut tls_stream, &registry);
         return Ok(());
     };
+    let client_id = registry
+        .clients
+        .lock()
+        .unwrap()
+        .get(&route.client_vkey)
+        .map(|client| client.id)
+        .unwrap_or(0);
+    crate::log_trace!(
+        "nps",
+        "new https connection,clientId {},host {},remote address {}",
+        client_id,
+        route.host,
+        remote
+    );
     match prepare_host_proxy_request(&registry, &route, &remote, &head, "https") {
         Ok((prepared_head, cache_key)) => {
             if let Err(err) = proxy_host_request(
@@ -1488,7 +1681,9 @@ fn handle_https_host_conn(inbound: TcpStream, registry: Arc<Registry>) -> io::Re
         Err(HostProxyError::Unauthorized) => {
             let _ = write_basic_auth_required(&mut tls_stream);
         }
-        Err(HostProxyError::InvalidRequest) => {}
+        Err(HostProxyError::InvalidRequest) => {
+            crate::log_notice!("nps", "the url {} can't be parsed!", host);
+        }
     }
     Ok(())
 }
@@ -1948,6 +2143,7 @@ fn validate_client_handshake(
     require_config_conn_allow: bool,
 ) -> io::Result<()> {
     if vkey.trim().is_empty() {
+        crate::log_info!("nps", "Current client connection validation error, close this client:{}", remote);
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "invalid verification key",
@@ -1959,6 +2155,8 @@ fn validate_client_handshake(
 
     let ip = remote_ip(remote);
     if registry.server.ip_limit && !ip.is_empty() && !is_ip_authorized(registry.as_ref(), &ip) {
+        crate::log_info!("nps", "The current ip {} is not allowed to connect", ip);
+        crate::log_info!("nps", "Current client connection validation error, close this client:{}", remote);
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("the ip {ip} is not in the validation list"),
@@ -1967,6 +2165,7 @@ fn validate_client_handshake(
     {
         let global = registry.global.lock().unwrap();
         if !ip.is_empty() && ip_in_list(&ip, &global.black_ip_list) {
+            crate::log_info!("nps", "Current client connection validation error, close this client:{}", remote);
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "remote ip is in global blacklist",
@@ -1976,6 +2175,7 @@ fn validate_client_handshake(
 
     let clients = registry.clients.lock().unwrap();
     let Some(client) = clients.get(vkey) else {
+        crate::log_info!("nps", "Current client connection validation error, close this client:{}", remote);
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "invalid verification key",
@@ -1983,24 +2183,28 @@ fn validate_client_handshake(
     };
     let info = &client.common.client;
     if !info.status {
+        crate::log_info!("nps", "Current client connection validation error, close this client:{}", remote);
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "client disabled",
         ));
     }
     if require_config_conn_allow && !info.config_conn_allow {
+        crate::log_info!("nps", "Current client connection validation error, close this client:{}", remote);
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "config connection is disabled for this client",
         ));
     }
     if !ip.is_empty() && ip_in_list(&ip, &info.black_ip_list) {
+        crate::log_info!("nps", "Current client connection validation error, close this client:{}", remote);
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "remote ip is in client blacklist",
         ));
     }
     if !ip.is_empty() && info.ip_white && !ip_in_list(&ip, &info.ip_white_list) {
+        crate::log_info!("nps", "Current client connection validation error, close this client:{}", remote);
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "remote ip is not in client whitelist",
@@ -2247,11 +2451,21 @@ fn prepare_host_proxy_request(
     };
     if let Some((user, pass)) = client_auth {
         if !user.is_empty() && !pass.is_empty() && !check_http_basic_auth(head, &user, &pass) {
+            crate::log_warn!("nps", "auth error unauthorized {}", remote);
             return Err(HostProxyError::Unauthorized);
         }
     }
 
-    let (method, path, _) = parse_http_request_line(head).ok_or(HostProxyError::InvalidRequest)?;
+    let (method, path, _) = parse_http_request_line(head).ok_or_else(|| {
+        crate::log_notice!(
+            "nps",
+            "the url {} can't be parsed!, host {}, remote address {}",
+            route.host,
+            route.host,
+            remote
+        );
+        HostProxyError::InvalidRequest
+    })?;
     let cache_key = cache_key_for_request(registry, scheme, route, &method, &path);
     let prepared = rewrite_http_request_head(
         head,
@@ -2280,6 +2494,18 @@ fn proxy_host_request<S>(
 where
     S: Read + Write + Send + 'static,
 {
+    if let Some((method, path, _)) = parse_http_request_line(&head) {
+        crate::log_info!(
+            "nps",
+            "http request, method {}, host {}, url {}, remote address {}, target {}",
+            method,
+            route.host,
+            path,
+            remote,
+            target
+        );
+    }
+
     if route.auto_https && registry.server.https_proxy_port > 0 {
         let redirect = format!(
             "https://{}:{}{}",
@@ -2309,6 +2535,7 @@ where
     }
 
     let (crypt, compress) = client_transport_flags(registry, &route.client_vkey, false);
+    let target_for_log = target.clone();
     let link = Link {
         kind: LinkKind::Http,
         target,
@@ -2322,10 +2549,25 @@ where
     let mut client_stream = match request_client_stream(registry, &route.client_vkey, link) {
         Ok(stream) => stream,
         Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            let client_id = registry
+                .clients
+                .lock()
+                .unwrap()
+                .get(&route.client_vkey)
+                .map(|client| client.id)
+                .unwrap_or(0);
+            crate::log_warn!(
+                "nps",
+                "client id {}, host id {}, error {}, when https connection",
+                client_id,
+                route.id,
+                err
+            );
             write_custom_404(&mut inbound, registry)?;
             return Ok(());
         }
         Err(err) => {
+            crate::log_notice!("nps", "connect to target {} error {}", target_for_log, err);
             write_http_response(
                 &mut inbound,
                 "502 Bad Gateway",
@@ -3082,6 +3324,13 @@ pub fn mutate_client_status(registry: &Arc<Registry>, params: &HashMap<String, S
         }
     };
     if let Some((vkey, previous, current)) = changed {
+        crate::log_info!(
+            "web",
+            "client status mutation id={} vkey={} status={}",
+            current.id,
+            vkey,
+            status
+        );
         stop_tunnel_runtimes(registry, &previous.tunnels);
         if status {
             start_active_tunnels_for_client(registry, &current);
@@ -3106,6 +3355,7 @@ pub fn mutate_client_delete(registry: &Arc<Registry>, params: &HashMap<String, S
         }
     };
     if let Some((vkey, removed)) = deleted {
+        crate::log_info!("web", "client delete mutation id={} vkey={}", removed.id, vkey);
         stop_tunnel_runtimes(registry, &removed.tunnels);
         terminate_client_connection(registry, &vkey, "client deleted");
         rebuild_secret_registry(registry);
@@ -3149,6 +3399,7 @@ pub fn mutate_client_add(registry: &Arc<Registry>, params: &HashMap<String, Stri
     config.id = id;
     config.no_store = false;
     config.create_time = now_text();
+    crate::log_info!("web", "client add mutation id={} vkey={}", id, config.common.vkey);
     registry.clients.lock().unwrap().insert(vkey, config);
     match persist_registry(registry) {
         Ok(()) => ajax_with_id(1, "add success", id),
@@ -3210,6 +3461,13 @@ pub fn mutate_client_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
         Some((vkey, previous, current))
     };
     if let Some((old_vkey, previous, current)) = edited {
+        crate::log_info!(
+            "web",
+            "client edit mutation id={} old_vkey={} new_vkey={}",
+            current.id,
+            old_vkey,
+            current.common.vkey
+        );
         if old_vkey != current.common.vkey || previous.common.client.status != current.common.client.status {
             stop_tunnel_runtimes(registry, &previous.tunnels);
             terminate_client_connection(
@@ -3285,6 +3543,13 @@ pub fn mutate_tunnel_status(
         result
     };
     if let Some((previous, current)) = modified {
+        crate::log_info!(
+            "web",
+            "tunnel status mutation id={} client_vkey={} status={}",
+            current.id,
+            current.client_vkey,
+            status
+        );
         stop_tunnel_runtime(registry, &previous);
         if status {
             start_tunnel_task(Arc::clone(registry), current);
@@ -3317,6 +3582,13 @@ pub fn mutate_tunnel_delete(registry: &Arc<Registry>, params: &HashMap<String, S
         result
     };
     if let Some(tunnel) = deleted {
+        crate::log_info!(
+            "web",
+            "tunnel delete mutation id={} client_vkey={} remark={}",
+            tunnel.id,
+            tunnel.client_vkey,
+            tunnel.remark
+        );
         stop_tunnel_runtime(registry, &tunnel);
         rebuild_secret_registry(registry);
         persist_ajax(registry, "delete success")
@@ -3356,6 +3628,13 @@ pub fn mutate_tunnel_copy(registry: &Arc<Registry>, params: &HashMap<String, Str
         }
     }
     if let Some(tunnel) = to_start {
+        crate::log_info!(
+            "web",
+            "tunnel copy mutation id={} client_vkey={} remark={}",
+            tunnel.id,
+            tunnel.client_vkey,
+            tunnel.remark
+        );
         if tunnel.server_port > 0 {
             start_tunnel_task(Arc::clone(registry), tunnel);
         }
@@ -3416,6 +3695,15 @@ pub fn mutate_tunnel_add(registry: &Arc<Registry>, params: &HashMap<String, Stri
         }
     }
     if let Some(tunnel) = should_start {
+        crate::log_info!(
+            "web",
+            "tunnel add mutation id={} client_vkey={} mode={} port={} remark={}",
+            tunnel.id,
+            tunnel.client_vkey,
+            tunnel.mode,
+            tunnel.server_port,
+            tunnel.remark
+        );
         start_tunnel_task(Arc::clone(registry), tunnel.clone());
         rebuild_secret_registry(registry);
         match persist_registry(registry) {
@@ -3470,6 +3758,15 @@ pub fn mutate_tunnel_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
         result
     };
     if let Some((previous, current)) = modified {
+        crate::log_info!(
+            "web",
+            "tunnel edit mutation id={} client_vkey={} mode={} port={} remark={}",
+            current.id,
+            current.client_vkey,
+            current.mode,
+            current.server_port,
+            current.remark
+        );
         stop_tunnel_runtime(registry, &previous);
         if current.status {
             start_tunnel_task(Arc::clone(registry), current);
@@ -3500,6 +3797,7 @@ pub fn mutate_host_status(
         found
     };
     if modified {
+        crate::log_info!("web", "host status mutation id={} is_close={}", id, is_close);
         persist_ajax(
             registry,
             if is_close {
@@ -3536,6 +3834,7 @@ pub fn mutate_host_delete(registry: &Arc<Registry>, params: &HashMap<String, Str
         removed
     };
     if deleted {
+        crate::log_info!("web", "host delete mutation id={}", id);
         persist_ajax(registry, "delete success")
     } else {
         ajax(0, "delete error")
@@ -3578,6 +3877,14 @@ pub fn mutate_host_add(registry: &Arc<Registry>, params: &HashMap<String, String
         }
     };
     if added {
+        crate::log_info!(
+            "web",
+            "host add mutation id={} client_id={} host={} location={}",
+            added_id,
+            client_id,
+            host.host,
+            host.location
+        );
         match persist_registry(registry) {
             Ok(()) => ajax_with_id(1, "add success", added_id),
             Err(err) => ajax(0, &format!("added but save failed: {err}")),
@@ -3610,6 +3917,7 @@ pub fn mutate_host_edit(registry: &Arc<Registry>, params: &HashMap<String, Strin
         found
     };
     if modified {
+        crate::log_info!("web", "host edit mutation id={}", id);
         persist_ajax(registry, "modified success")
     } else {
         ajax(0, "modified error")
@@ -3627,6 +3935,7 @@ pub fn mutate_global_save(registry: &Arc<Registry>, params: &HashMap<String, Str
             .map(ToOwned::to_owned)
             .collect();
     }
+    crate::log_info!("web", "global save mutation");
     persist_ajax(registry, "save success")
 }
 

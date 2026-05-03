@@ -37,6 +37,7 @@ struct Args {
 
 pub fn entry() -> io::Result<()> {
     let args = parse_args();
+    let start_cmd = env::args().skip(1).collect::<Vec<_>>().join(" ");
     if args.command == "help" {
         print_npc_help();
         return Ok(());
@@ -46,6 +47,9 @@ pub fn entry() -> io::Result<()> {
         return Ok(());
     }
     crate::logging::init_console_from_text(&args.console_log_level);
+    if !start_cmd.is_empty() {
+        crate::log_info!("npc", "start cmd:{start_cmd}");
+    }
     if !args.log_path.is_empty() {
         crate::log_info!(
             "npc",
@@ -101,7 +105,13 @@ fn run(args: Args) -> io::Result<()> {
             args.config.clone()
         };
         if Path::new(&path).exists() {
-            let config = load_client_config(&path)?;
+            let config = match load_client_config(&path) {
+                Ok(config) => config,
+                Err(err) => {
+                    crate::log_error!("npc", "Config file {} loading error {}", path, err);
+                    return Err(err);
+                }
+            };
             crate::log_info!("npc", "Loading configuration file {path} successfully");
             crate::log_info!(
                 "npc",
@@ -193,12 +203,36 @@ fn send_config(config: &ClientRuntimeConfig) -> io::Result<()> {
             }
             Ok(())
         }
-        ServerMessage::Error { message } => Err(classify_server_error(message)),
+        ServerMessage::Error { message } => {
+            log_config_mode_server_error(&message);
+            Err(classify_server_error(message))
+        }
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unexpected config response: {other:?}"),
         )),
     }
+}
+
+fn log_config_mode_server_error(message: &str) {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("web_user") && lower.contains("occupied") {
+        crate::log_error!("npc", "the web_user may have been occupied!");
+        return;
+    }
+    if lower.contains("occupied")
+        || lower.contains("already in use")
+        || lower.contains("not allowed")
+        || lower.contains("validation list")
+        || lower.contains("allow")
+    {
+        crate::log_error!(
+            "npc",
+            "The server returned an error, which port or host may have been occupied or not allowed to open."
+        );
+        return;
+    }
+    crate::log_error!("npc", "{}", message);
 }
 
 fn control_loop(config: ClientRuntimeConfig) -> io::Result<()> {
@@ -294,6 +328,33 @@ fn handle_open(
     link_id: u64,
     link: Link,
 ) -> io::Result<()> {
+    match link.kind {
+        LinkKind::Tcp | LinkKind::Secret | LinkKind::P2p => {
+            crate::log_info!(
+                "npc",
+                "new tcp connection with the goal of {}, remote address:{}",
+                link.target,
+                link.remote_addr
+            );
+        }
+        LinkKind::Udp => {
+            crate::log_info!(
+                "npc",
+                "new udp connection with the goal of {}, remote address:{}",
+                link.target,
+                link.remote_addr
+            );
+        }
+        LinkKind::Http => {
+            crate::log_info!(
+                "npc",
+                "http request, remote address:{}, target:{}",
+                link.remote_addr,
+                link.target
+            );
+        }
+        LinkKind::File => {}
+    }
     if let Ok(stream) = open_mux_stream(&config, &mux_session, link_id) {
         return serve_link(Box::new(stream), link);
     }
@@ -324,6 +385,7 @@ fn serve_link(stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
             let target = match TcpStream::connect(&target_addr) {
                 Ok(t) => t,
                 Err(err) => {
+                    crate::log_info!("npc", "new connect error ,the target {} refuse to connect", target_addr);
                     crate::log_error!("npc", "Accept server data error read tcp ->{}: {}, end this service", target_addr, err);
                     return Err(err);
                 }

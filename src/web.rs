@@ -963,7 +963,9 @@ async fn handle_post_mutation(
     } else {
         &path
     };
+    crate::log_info!("web", "mutation request path={} params={}", clean_path, p.len());
     if let Err(message) = authorize_mutation(&r, &session, clean_path, &mut p) {
+        crate::log_warn!("web", "mutation denied path={} reason={}", clean_path, message);
         return axum::Json(serde_json::json!({"status":0, "msg":message})).into_response();
     }
     let res = match clean_path {
@@ -988,6 +990,7 @@ async fn handle_post_mutation(
             serde_json::json!({"status":0, "msg":"unsupported"}).to_string()
         }
     };
+    crate::log_info!("web", "mutation response path={} body={}", clean_path, res);
     axum::Json(serde_json::from_str::<Value>(&res).unwrap()).into_response()
 }
 
