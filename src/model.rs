@@ -82,7 +82,7 @@ impl Default for ServerConfig {
             tls_bridge_port: 8025,
             p2p_ip: "127.0.0.1".to_string(),
             p2p_port: 6000,
-            log_level: "7".to_string(),
+            log_level: "info".to_string(),
             log_path: String::new(),
         }
     }

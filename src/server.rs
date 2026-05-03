@@ -212,14 +212,16 @@ pub fn entry() -> io::Result<()> {
         config_missing = true;
         ServerConfig::default()
     };
-    if let Some(level) = arg_value(&args, "-log_level").or_else(|| arg_value(&args, "--log-level"))
-    {
-        config.log_level = level;
-    }
+    let console_log_level = arg_value(&args, "--console-log-level")
+        .or_else(|| arg_value(&args, "-console_log_level"))
+        .or_else(|| arg_value(&args, "-log_level"))
+        .or_else(|| arg_value(&args, "--log-level"))
+        .unwrap_or_else(|| config.log_level.clone());
+    config.log_level = console_log_level;
     if let Some(path) = arg_value(&args, "-log_path").or_else(|| arg_value(&args, "--log-path")) {
         config.log_path = path;
     }
-    crate::logging::init_from_text(&config.log_level);
+    crate::logging::init_console_from_text(&config.log_level);
     if config_missing {
         crate::log_warn!(
             "nps",
@@ -3591,8 +3593,9 @@ Usage:
 Options:
   -conf_path <file>        Path to nps.conf. Default: conf/nps.conf
   --conf-path <file>       Same as -conf_path
-  -log_level <0-8|name>    Console log level. Go-compatible default: 7
-                           3=error, 4=warn, 5=notice, 6=info, 7=debug, 8=trace
+    --console-log-level <info|debug>
+                                                     Console log level. Default: info.
+                                                     debug prints detailed troubleshooting logs.
   -log_path <file>         Reserved for service/file logging compatibility
   -version, --version      Show version information
   -h, --help               Show this help
@@ -3606,7 +3609,7 @@ Common nps.conf keys:
 
 Examples:
   nps -conf_path conf/nps.conf
-  nps --conf-path conf/nps.conf --log-level info
+    nps --conf-path conf/nps.conf --console-log-level debug
 
 Go nps service commands such as install/start/stop/restart are not implemented in
 this Rust reconstruction yet; run the binary directly or manage it with your OS

@@ -31,9 +31,8 @@ struct Args {
     register_hours: u32,
     command: String,
     tls_enable: bool,
-    log_level: String,
+    console_log_level: String,
     log_path: String,
-    debug: bool,
 }
 
 pub fn entry() -> io::Result<()> {
@@ -46,13 +45,7 @@ pub fn entry() -> io::Result<()> {
         println!("RustNps npc version {VERSION}, core {CORE_VERSION}");
         return Ok(());
     }
-    crate::logging::init_from_text(&args.log_level);
-    if !args.debug {
-        crate::log_info!(
-            "npc",
-            "debug=false requested; service/file logging is reserved, console logging remains enabled"
-        );
-    }
+    crate::logging::init_console_from_text(&args.console_log_level);
     if !args.log_path.is_empty() {
         crate::log_info!(
             "npc",
@@ -591,8 +584,7 @@ fn parse_args() -> Args {
         local_port: 2000,
         local_type: "p2p".to_string(),
         register_hours: 2,
-        log_level: "7".to_string(),
-        debug: true,
+        console_log_level: "info".to_string(),
         ..Args::default()
     };
 
@@ -629,8 +621,10 @@ fn parse_args() -> Args {
         assign_arg(item, "--target", &next, &mut args.target);
         assign_arg(item, "-local_type", &next, &mut args.local_type);
         assign_arg(item, "--local-type", &next, &mut args.local_type);
-        assign_arg(item, "-log_level", &next, &mut args.log_level);
-        assign_arg(item, "--log-level", &next, &mut args.log_level);
+        assign_arg(item, "-console_log_level", &next, &mut args.console_log_level);
+        assign_arg(item, "--console-log-level", &next, &mut args.console_log_level);
+        assign_arg(item, "-log_level", &next, &mut args.console_log_level);
+        assign_arg(item, "--log-level", &next, &mut args.console_log_level);
         assign_arg(item, "-log_path", &next, &mut args.log_path);
         assign_arg(item, "--log-path", &next, &mut args.log_path);
 
@@ -656,11 +650,20 @@ fn parse_args() -> Args {
         if item == "-tls_enable" || item == "--tls-enable" {
             args.tls_enable = next.is_empty() || next.starts_with('-') || parse_bool(&next);
         }
-        if let Some(value) = value_of(item, "-debug").or_else(|| value_of(item, "--debug")) {
-            args.debug = parse_bool(&value);
-        }
         if item == "-debug" || item == "--debug" {
-            args.debug = next.is_empty() || next.starts_with('-') || parse_bool(&next);
+            args.console_log_level = if next.is_empty() || next.starts_with('-') || parse_bool(&next)
+            {
+                "debug".to_string()
+            } else {
+                "info".to_string()
+            };
+        }
+        if let Some(value) = value_of(item, "-debug").or_else(|| value_of(item, "--debug")) {
+            args.console_log_level = if parse_bool(&value) {
+                "debug".to_string()
+            } else {
+                "info".to_string()
+            };
         }
     }
     args
@@ -699,10 +702,11 @@ Connection options:
   -config <file>          Path to npc.conf. Default: conf/npc.conf
   -type <tcp|kcp>         Bridge connection type. Current RustNps runtime supports tcp
   -tls_enable=true        Enable TLS bridge connection flag in config/CLI metadata
-  -log_level <0-8|name>   Console log level. Go-compatible default: 7
-                          3=error, 4=warn, 5=notice, 6=info, 7=debug, 8=trace
+    --console-log-level <info|debug>
+                                                    Console log level. Default: info.
+                                                    debug prints detailed troubleshooting logs.
   -log_path <file>        Reserved for service/file logging compatibility
-  -debug=<true|false>     Go-compatible switch; console logging remains enabled
+    -debug=<true|false>     Legacy alias for --console-log-level debug/info
 
 Visitor / secret / p2p options:
   -password <password>    Start local visitor mode with a secret/p2p password
@@ -718,6 +722,7 @@ Commands:
 Examples:
   npc -server 127.0.0.1:8024 -vkey 123
   npc -config conf/npc.conf
+    npc --console-log-level debug -server 127.0.0.1:8024 -vkey 123
   npc register -server 127.0.0.1:8024 -vkey 123 -time 2
   npc -server 127.0.0.1:8024 -password ssh2 -local_type secret -local_port 2001"#
     );

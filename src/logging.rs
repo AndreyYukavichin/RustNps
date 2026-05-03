@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-static LOG_LEVEL: AtomicU8 = AtomicU8::new(Level::Debug as u8);
+static LOG_LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Level {
@@ -30,6 +30,10 @@ pub fn init_from_text(level: &str) {
     LOG_LEVEL.store(parse_level(level), Ordering::Relaxed);
 }
 
+pub fn init_console_from_text(level: &str) {
+    LOG_LEVEL.store(parse_console_level(level), Ordering::Relaxed);
+}
+
 pub fn parse_level(level: &str) -> u8 {
     let value = level.trim().to_ascii_lowercase();
     match value.as_str() {
@@ -39,7 +43,23 @@ pub fn parse_level(level: &str) -> u8 {
         "info" => Level::Info as u8,
         "debug" => Level::Debug as u8,
         "trace" => Level::Trace as u8,
-        _ => value.parse::<u8>().unwrap_or(Level::Debug as u8),
+        _ => value.parse::<u8>().unwrap_or(Level::Info as u8),
+    }
+}
+
+pub fn parse_console_level(level: &str) -> u8 {
+    let value = level.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "debug" => Level::Debug as u8,
+        "info" | "" => Level::Info as u8,
+        _ => {
+            let parsed = parse_level(&value);
+            if parsed >= Level::Debug as u8 {
+                Level::Debug as u8
+            } else {
+                Level::Info as u8
+            }
+        }
     }
 }
 
@@ -95,4 +115,27 @@ macro_rules! log_trace {
     ($target:expr, $($arg:tt)*) => {
         $crate::logging::log($crate::logging::Level::Trace, $target, format_args!($($arg)*))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_console_level, Level};
+
+    #[test]
+    fn console_log_level_accepts_info_and_debug() {
+        assert_eq!(parse_console_level("info"), Level::Info as u8);
+        assert_eq!(parse_console_level("debug"), Level::Debug as u8);
+    }
+
+    #[test]
+    fn console_log_level_preserves_legacy_numeric_values() {
+        assert_eq!(parse_console_level("6"), Level::Info as u8);
+        assert_eq!(parse_console_level("7"), Level::Debug as u8);
+        assert_eq!(parse_console_level("8"), Level::Debug as u8);
+    }
+
+    #[test]
+    fn console_log_level_defaults_to_info_for_unknown_values() {
+        assert_eq!(parse_console_level("bogus"), Level::Info as u8);
+    }
 }
