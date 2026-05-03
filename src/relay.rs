@@ -7,7 +7,7 @@ use snap::read::FrameDecoder;
 use snap::write::FrameEncoder;
 use std::any::Any;
 use std::io::{self, Cursor, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,9 +21,11 @@ pub trait RelayRead: Read + Send {}
 
 impl<T> RelayRead for T where T: Read + Send {}
 
-pub trait RelayWrite: Write + Send {}
-
-impl<T> RelayWrite for T where T: Write + Send {}
+pub trait RelayWrite: Write + Send {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 pub trait IntoIoHalves {
     fn into_io_halves(self) -> io::Result<(Box<dyn RelayRead>, Box<dyn RelayWrite>)>;
@@ -32,7 +34,10 @@ pub trait IntoIoHalves {
 impl IntoIoHalves for TcpStream {
     fn into_io_halves(self) -> io::Result<(Box<dyn RelayRead>, Box<dyn RelayWrite>)> {
         let reader = self.try_clone()?;
-        Ok((Box::new(reader), Box::new(self)))
+        Ok((
+            Box::new(TcpReadHalf { inner: reader }),
+            Box::new(TcpWriteHalf { inner: self }),
+        ))
     }
 }
 
@@ -101,11 +106,15 @@ where
     let (left_reader, left_writer) = left.into_io_halves()?;
     let (right_reader, right_writer) = right.into_io_halves()?;
 
-    let a_to_b = thread::spawn(move || copy_one_way(left_reader, right_writer));
-    let b_to_a = thread::spawn(move || copy_one_way(right_reader, left_writer));
+    let a_to_b = thread::spawn(move || copy_one_way("left_to_right", left_reader, right_writer));
+    let b_to_a = thread::spawn(move || copy_one_way("right_to_left", right_reader, left_writer));
 
-    let _ = a_to_b.join().ok();
-    let _ = b_to_a.join().ok();
+    if a_to_b.join().is_err() {
+        crate::log_warn!("relay", "copy left_to_right thread panicked");
+    }
+    if b_to_a.join().is_err() {
+        crate::log_warn!("relay", "copy right_to_left thread panicked");
+    }
     Ok(())
 }
 
@@ -130,15 +139,41 @@ where
     Ok(())
 }
 
-fn copy_one_way(mut reader: Box<dyn RelayRead>, mut writer: Box<dyn RelayWrite>) -> io::Result<()> {
+fn copy_one_way(
+    direction: &str,
+    mut reader: Box<dyn RelayRead>,
+    mut writer: Box<dyn RelayWrite>,
+) -> io::Result<()> {
     let mut buf = vec![0_u8; 16 * 1024];
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            Err(err) => {
+                crate::log_warn!("relay", "copy {} read failed err={}", direction, err);
+                return Err(err);
+            }
+        };
         if n == 0 {
+            crate::log_debug!("relay", "copy {} eof", direction);
+            match writer.shutdown_write() {
+                Ok(()) => {
+                    crate::log_debug!("relay", "copy {} shutdown_write ok", direction);
+                }
+                Err(err) => {
+                    crate::log_warn!("relay", "copy {} shutdown_write failed err={}", direction, err);
+                }
+            }
             return Ok(());
         }
-        writer.write_all(&buf[..n])?;
-        writer.flush()?;
+        crate::log_trace!("relay", "copy {} write bytes={}", direction, n);
+        if let Err(err) = writer.write_all(&buf[..n]) {
+            crate::log_warn!("relay", "copy {} write failed bytes={} err={}", direction, n, err);
+            return Err(err);
+        }
+        if let Err(err) = writer.flush() {
+            crate::log_warn!("relay", "copy {} flush failed err={}", direction, err);
+            return Err(err);
+        }
     }
 }
 
@@ -169,6 +204,36 @@ impl RelayStream for TcpStream {
 
     fn into_io_halves(self: Box<Self>) -> io::Result<(Box<dyn RelayRead>, Box<dyn RelayWrite>)> {
         IntoIoHalves::into_io_halves(*self)
+    }
+}
+
+struct TcpReadHalf {
+    inner: TcpStream,
+}
+
+impl Read for TcpReadHalf {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+struct TcpWriteHalf {
+    inner: TcpStream,
+}
+
+impl Write for TcpWriteHalf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl RelayWrite for TcpWriteHalf {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        self.inner.shutdown(Shutdown::Write)
     }
 }
 
@@ -317,6 +382,12 @@ impl Write for MeteredWriterHalf {
     }
 }
 
+impl RelayWrite for MeteredWriterHalf {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        self.inner.shutdown_write()
+    }
+}
+
 struct RateGovernor {
     bytes_per_sec: u64,
     allowance: f64,
@@ -453,6 +524,13 @@ impl TlsConnection {
             Self::Server(conn) => conn.writer().write(buf),
         }
     }
+
+    fn send_close_notify(&mut self) {
+        match self {
+            Self::Client(conn) => conn.send_close_notify(),
+            Self::Server(conn) => conn.send_close_notify(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -581,6 +659,18 @@ impl Write for TlsWriteHalf {
     }
 }
 
+impl RelayWrite for TlsWriteHalf {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        {
+            let mut conn = self.shared.conn.lock().unwrap();
+            conn.send_close_notify();
+        }
+        flush_pending_tls(&self.shared)?;
+        let mut writer = self.shared.writer.lock().unwrap();
+        writer.shutdown_write()
+    }
+}
+
 impl RelayStream for TlsRelayStream {
     fn as_any(&self) -> &dyn Any {
         self
@@ -668,6 +758,13 @@ impl Write for SnappyWriteHalf {
     }
 }
 
+impl RelayWrite for SnappyWriteHalf {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        self.inner.flush()?;
+        self.inner.get_mut().shutdown_write()
+    }
+}
+
 #[cfg(test)]
 struct LegacyReadHalf {
     inner: Arc<Mutex<Box<dyn RelayStream>>>,
@@ -695,6 +792,9 @@ impl Write for LegacyWriteHalf {
         self.inner.lock().unwrap().flush()
     }
 }
+
+#[cfg(test)]
+impl RelayWrite for LegacyWriteHalf {}
 
 #[cfg(test)]
 fn legacy_split_stream(stream: Box<dyn RelayStream>) -> io::Result<(Box<dyn RelayRead>, Box<dyn RelayWrite>)> {
@@ -1052,6 +1152,19 @@ mod tests {
         round_trip_transport(true, false, b"tls-payload");
     }
 
+    #[test]
+    fn copy_one_way_shuts_down_writer_on_eof() {
+        let shutdown_called = Arc::new(Mutex::new(false));
+        let reader = Box::new(MockReader::default()) as Box<dyn RelayRead>;
+        let writer = Box::new(MockWriter {
+            shutdown_called: Arc::clone(&shutdown_called),
+        }) as Box<dyn RelayWrite>;
+
+        copy_one_way("test", reader, writer).unwrap();
+
+        assert!(*shutdown_called.lock().unwrap());
+    }
+
     fn round_trip_transport(crypt: bool, compress: bool, payload: &[u8]) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1086,6 +1199,36 @@ mod tests {
     #[derive(Default)]
     struct MockStream {
         written: Vec<u8>,
+    }
+
+    #[derive(Default)]
+    struct MockReader;
+
+    impl Read for MockReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    struct MockWriter {
+        shutdown_called: Arc<Mutex<bool>>,
+    }
+
+    impl Write for MockWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RelayWrite for MockWriter {
+        fn shutdown_write(&mut self) -> io::Result<()> {
+            *self.shutdown_called.lock().unwrap() = true;
+            Ok(())
+        }
     }
 
     impl Read for MockStream {

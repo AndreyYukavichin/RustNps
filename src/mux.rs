@@ -383,6 +383,13 @@ impl Write for MuxWriteHalf {
     }
 }
 
+impl RelayWrite for MuxWriteHalf {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        self.close_write_once();
+        Ok(())
+    }
+}
+
 impl Drop for MuxWriteHalf {
     fn drop(&mut self) {
         self.close_write_once();

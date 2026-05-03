@@ -425,7 +425,20 @@ fn serve_link(stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
         LinkKind::File => serve_file(stream, link),
         LinkKind::Http => {
             let mut stream = stream;
+            crate::log_debug!(
+                "npc",
+                "serve_link http reading request head target={} remote={}",
+                target_addr,
+                link.remote_addr
+            );
             let head = read_http_head(&mut stream, 64 * 1024)?;
+            crate::log_debug!(
+                "npc",
+                "serve_link http request head read bytes={} target={} remote={}",
+                head.len(),
+                target_addr,
+                link.remote_addr
+            );
             if let Some((method, path, _)) = parse_http_request_line(&head) {
                 let host = http_header_value(&head, "Host").unwrap_or_default();
                 crate::log_trace!(
@@ -445,8 +458,50 @@ fn serve_link(stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
                     return Err(err);
                 }
             };
-            target.write_all(&head)?;
-            copy_bidirectional(stream, target)
+            crate::log_debug!(
+                "npc",
+                "serve_link http forwarding request head bytes={} target={} remote={}",
+                head.len(),
+                target_addr,
+                link.remote_addr
+            );
+            if let Err(err) = target.write_all(&head) {
+                crate::log_warn!(
+                    "npc",
+                    "serve_link http forward request head failed target={} remote={} err={}",
+                    target_addr,
+                    link.remote_addr,
+                    err
+                );
+                return Err(err);
+            }
+            crate::log_debug!(
+                "npc",
+                "serve_link http request head forwarded target={} remote={} starting relay=true",
+                target_addr,
+                link.remote_addr
+            );
+            let result = copy_bidirectional(stream, target);
+            match &result {
+                Ok(()) => {
+                    crate::log_debug!(
+                        "npc",
+                        "serve_link http relay finished target={} remote={} status=ok",
+                        target_addr,
+                        link.remote_addr
+                    );
+                }
+                Err(err) => {
+                    crate::log_warn!(
+                        "npc",
+                        "serve_link http relay finished target={} remote={} status=err err={}",
+                        target_addr,
+                        link.remote_addr,
+                        err
+                    );
+                }
+            }
+            result
         }
         LinkKind::Tcp | LinkKind::Secret | LinkKind::P2p => {
             let target = match TcpStream::connect(&target_addr) {

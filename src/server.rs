@@ -1568,7 +1568,7 @@ fn start_http_host_listener(registry: Arc<Registry>) -> io::Result<()> {
             }
             match prepare_host_proxy_request(&registry, &route, &remote, &head, "http") {
                 Ok((prepared_head, cache_key)) => {
-                    if let Err(err) = proxy_host_request(
+                    if let Err(err) = proxy_host_request_tcp(
                         &registry,
                         inbound,
                         route,
@@ -1991,6 +1991,12 @@ impl Write for CountedWriteHalf {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+impl RelayWrite for CountedWriteHalf {
+    fn shutdown_write(&mut self) -> io::Result<()> {
+        self.inner.shutdown_write()
     }
 }
 
@@ -2750,9 +2756,104 @@ fn prepare_host_proxy_request(
         &route.header_change,
         remote,
         registry.server.http_add_origin_header,
-        cache_key.is_some(),
+        true,
     );
     Ok((prepared, cache_key))
+}
+
+fn proxy_host_request_tcp(
+    registry: &Arc<Registry>,
+    mut inbound: TcpStream,
+    route: Host,
+    remote: String,
+    target: String,
+    head: Vec<u8>,
+    cache_key: Option<String>,
+) -> io::Result<()> {
+    if let Some((method, path, _)) = parse_http_request_line(&head) {
+        crate::log_info!(
+            "nps",
+            "http request, method {}, host {}, url {}, remote address {}, target {}",
+            method,
+            route.host,
+            path,
+            remote,
+            target
+        );
+    }
+
+    if route.auto_https && registry.server.https_proxy_port > 0 {
+        let redirect = format!(
+            "https://{}:{}{}",
+            strip_host_port(&route.host),
+            registry.server.https_proxy_port,
+            route.location
+        );
+        let body = format!(
+            "<html><body><a href=\"{redirect}\">Moved Permanently</a></body></html>"
+        );
+        let header = format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: {redirect}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        inbound.write_all(header.as_bytes())?;
+        inbound.write_all(body.as_bytes())?;
+        inbound.flush()?;
+        return Ok(());
+    }
+
+    if let Some(key) = cache_key.as_ref() {
+        if let Some(cached) = registry.http_cache.lock().unwrap().get(key) {
+            inbound.write_all(&cached)?;
+            inbound.flush()?;
+            return Ok(());
+        }
+    }
+
+    let (crypt, compress) = client_transport_flags(registry, &route.client_vkey, false);
+    let target_for_log = target.clone();
+    let link = Link {
+        kind: LinkKind::Http,
+        target,
+        remote_addr: remote,
+        crypt,
+        compress,
+        local_proxy: route.target.local_proxy,
+        proto_version: String::new(),
+        file: None,
+    };
+    let mut client_stream = match request_client_stream(registry, &route.client_vkey, link) {
+        Ok(stream) => stream,
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            let client_id = registry
+                .clients
+                .lock()
+                .unwrap()
+                .get(&route.client_vkey)
+                .map(|client| client.id)
+                .unwrap_or(0);
+            crate::log_warn!(
+                "nps",
+                "client id {}, host id {}, error {}, when https connection",
+                client_id,
+                route.id,
+                err
+            );
+            write_custom_404(&mut inbound, registry)?;
+            return Ok(());
+        }
+        Err(err) => {
+            crate::log_notice!("nps", "connect to target {} error {}", target_for_log, err);
+            write_connection_fail(&mut inbound)?;
+            return Err(err);
+        }
+    };
+    client_stream.write_all(&head)?;
+
+    if let Some(key) = cache_key {
+        return proxy_and_cache_http_response(registry, inbound, client_stream, key);
+    }
+    copy_bidirectional(inbound, client_stream)
 }
 
 fn proxy_host_request<S>(
