@@ -148,7 +148,10 @@ impl HostCertResolver {
 
 impl ResolvesServerCert for HostCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        let server_name = client_hello.server_name()?.trim().trim_end_matches('.').to_ascii_lowercase();
+        let Some(server_name) = client_hello.server_name() else {
+            return self.default.as_ref().map(Arc::clone);
+        };
+        let server_name = server_name.trim().trim_end_matches('.').to_ascii_lowercase();
         for (domain, cert) in &self.exact {
             if *domain == server_name {
                 return Some(Arc::clone(cert));
@@ -335,6 +338,55 @@ mod tests {
         let second = connect_and_capture_cert(addr, "two.test", &[cert_one_der, cert_two_der.clone()]);
         assert_eq!(second, cert_two_der.as_ref());
 
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn no_sni_handshake_falls_back_to_default_certificate() {
+        let cert = generate_simple_self_signed(vec!["fallback.test".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        let cert_der: CertificateDer<'static> = cert.cert.der().clone();
+
+        let mut host = Host::default();
+        host.host = "fallback.test".to_string();
+        host.scheme = "https".to_string();
+        host.cert_file_path = cert_pem;
+        host.key_file_path = key_pem;
+
+        let server_config = build_server_config(&[host])
+            .expect("build tls config")
+            .expect("non-empty tls config");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut tls = handshake(socket, server_config).unwrap();
+            tls.write_all(b"ok").unwrap();
+            tls.flush().unwrap();
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der.clone()).unwrap();
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.enable_sni = false;
+        let socket = TcpStream::connect(addr).unwrap();
+        let mut conn = ClientConnection::new(
+            Arc::new(client_config),
+            ServerName::try_from("fallback.test".to_string()).unwrap(),
+        )
+        .unwrap();
+        conn.complete_io(&mut socket.try_clone().unwrap()).unwrap();
+        let certs = conn.peer_certificates().expect("peer certs");
+        assert_eq!(certs[0].as_ref(), cert_der.as_ref());
+
+        let mut buf = [0_u8; 2];
+        let mut tls = StreamOwned::new(conn, socket);
+        tls.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ok");
         server.join().unwrap();
     }
 

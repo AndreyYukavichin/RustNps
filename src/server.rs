@@ -9,10 +9,10 @@ use crate::protocol::{
     LinkKind, ServerMessage,
 };
 use crate::relay::{
-    check_http_basic_auth, copy_bidirectional, copy_bidirectional_legacy, md5_hex,
+    check_http_basic_auth, copy_bidirectional, md5_hex,
     http_header_value, parse_http_host_path, parse_http_request_line, parse_http_status_code,
     parse_http_target, read_http_head, rewrite_http_request_head, wrap_server_transport,
-    write_http_response, RelayPolicy, RelayRead, RelayStream, RelayWrite,
+    write_http_response, IntoIoHalves, RelayPolicy, RelayRead, RelayStream, RelayWrite,
 };
 use crate::socks5::accept_socks5;
 use crate::store::{PersistentState, PersistentStore};
@@ -123,6 +123,7 @@ pub struct Registry {
     pub controls: Mutex<HashMap<String, ControlHandle>>,
     pub mux_sessions: Mutex<HashMap<String, Arc<MuxSession>>>,
     listener_shutdowns: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    health_targets: Mutex<HashMap<String, HashSet<String>>>,
     tunnel_live_conns: Mutex<HashMap<u64, HashMap<u64, TcpStream>>>,
     pub pending: Mutex<HashMap<u64, Sender<Box<dyn RelayStream>>>>,
     pub clients: Mutex<HashMap<String, ClientRuntimeConfig>>,
@@ -148,6 +149,7 @@ impl Registry {
             controls: Mutex::new(HashMap::new()),
             mux_sessions: Mutex::new(HashMap::new()),
             listener_shutdowns: Mutex::new(HashMap::new()),
+            health_targets: Mutex::new(HashMap::new()),
             tunnel_live_conns: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),
@@ -648,6 +650,31 @@ fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Res
             update_client_last_online_addr(&registry, &vkey, &remote_addr);
             write_message(&mut stream, &ok("config accepted"))?;
         }
+        BridgeHello::Health {
+            vkey,
+            target,
+            status,
+        } => {
+            if let Err(err) = validate_client_handshake(&registry, &vkey, &remote_addr, false) {
+                write_message(&mut stream, &error(err.to_string()))?;
+                return Ok(());
+            }
+            if target.trim().is_empty() {
+                write_message(&mut stream, &error("invalid health target".to_string()))?;
+                return Ok(());
+            }
+            set_client_health_target_state(&registry, &vkey, &target, status);
+            let client_id = registry.clients.lock().unwrap().get(&vkey).map(|c| c.id).unwrap_or(0);
+            crate::log_debug!(
+                "nps",
+                "clientId {} health report received, address:{}, target={}, status={}",
+                client_id,
+                remote_addr,
+                target,
+                status
+            );
+            write_message(&mut stream, &ok("health accepted"))?;
+        }
         BridgeHello::Data { vkey: _, link_id } => {
             crate::log_trace!(
                 "nps",
@@ -737,11 +764,31 @@ fn install_client_config(
         normalized.tunnels = expanded.clone();
         clients.insert(vkey.clone(), normalized);
     }
+    registry.health_targets.lock().unwrap().remove(&vkey);
 
     for tunnel in expanded {
         start_tunnel_task(Arc::clone(&registry), tunnel);
     }
     Ok(())
+}
+
+fn set_client_health_target_state(
+    registry: &Arc<Registry>,
+    vkey: &str,
+    target: &str,
+    enabled: bool,
+) {
+    let mut health_targets = registry.health_targets.lock().unwrap();
+    let entry = health_targets
+        .entry(vkey.to_string())
+        .or_insert_with(HashSet::new);
+    if enabled {
+        if entry.remove(target) {
+            crate::log_info!("nps", "health target restored client_vkey={} target={}", vkey, target);
+        }
+    } else if entry.insert(target.to_string()) {
+        crate::log_warn!("nps", "health target removed client_vkey={} target={}", vkey, target);
+    }
 }
 
 fn expand_runtime_tunnels(config: &ClientRuntimeConfig) -> Vec<Tunnel> {
@@ -1237,7 +1284,7 @@ fn start_http_proxy_listener(
                 crypt,
                 compress,
                 local_proxy: tunnel.target.local_proxy,
-                proto_version: String::new(),
+                proto_version: tunnel.proto_version.clone(),
                 file: None,
             };
             match request_client_stream(&registry, &tunnel.client_vkey, link) {
@@ -1761,9 +1808,7 @@ fn handle_secret_visitor(
         return Ok(());
     };
     let target = if visitor_target.trim().is_empty() {
-        tunnel
-            .target
-            .pick(0)
+        pick_runtime_target(&registry, &tunnel.client_vkey, &tunnel.target, 0)
             .map(|(target, _)| target)
             .unwrap_or_else(|| tunnel.target.target_str.clone())
     } else {
@@ -2444,9 +2489,36 @@ fn ip_in_list(ip: &str, items: &[String]) -> bool {
 fn select_target(registry: &Arc<Registry>, key: &str, tunnel: &Tunnel) -> Option<String> {
     let mut cursors = registry.cursors.lock().unwrap();
     let cursor = *cursors.get(key).unwrap_or(&0);
-    let (target, next) = tunnel.target.pick(cursor)?;
+    let (target, next) = pick_runtime_target(registry, &tunnel.client_vkey, &tunnel.target, cursor)?;
     cursors.insert(key.to_string(), next);
     Some(target)
+}
+
+fn pick_runtime_target(
+    registry: &Arc<Registry>,
+    client_vkey: &str,
+    target: &Target,
+    cursor: usize,
+) -> Option<(String, usize)> {
+    let removed = registry
+        .health_targets
+        .lock()
+        .unwrap()
+        .get(client_vkey)
+        .cloned()
+        .unwrap_or_default();
+    let items: Vec<String> = target
+        .target_str
+        .split('\n')
+        .map(str::trim)
+        .filter(|item| !item.is_empty() && !removed.contains(*item))
+        .map(ToOwned::to_owned)
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    let index = cursor % items.len();
+    Some((items[index].clone(), index + 1))
 }
 
 fn tunnel_is_active(registry: &Arc<Registry>, id: u64) -> bool {
@@ -2495,7 +2567,7 @@ fn find_host_route(
             if !path.starts_with(&route.location) {
                 continue;
             }
-            let Some((target, _)) = route.target.pick(0) else {
+            let Some((target, _)) = pick_runtime_target(registry, &route.client_vkey, &route.target, 0) else {
                 continue;
             };
             let replace = best
@@ -2527,6 +2599,7 @@ fn build_tls_config_for_registry(registry: &Arc<Registry>) -> io::Result<Option<
     build_server_config(&hosts)
 }
 
+#[derive(Debug)]
 enum HostProxyError {
     Unauthorized,
     InvalidRequest,
@@ -2866,7 +2939,7 @@ fn proxy_host_request<S>(
     cache_key: Option<String>,
 ) -> io::Result<()>
 where
-    S: Read + Write + Send + 'static,
+    S: Read + Write + Send + IntoIoHalves + 'static,
 {
     if let Some((method, path, _)) = parse_http_request_line(&head) {
         crate::log_info!(
@@ -2951,7 +3024,7 @@ where
     if let Some(key) = cache_key {
         return proxy_and_cache_http_response(registry, inbound, client_stream, key);
     }
-    copy_bidirectional_legacy(inbound, client_stream)
+    copy_bidirectional(inbound, client_stream)
 }
 
 fn proxy_and_cache_http_response<S>(
@@ -3215,6 +3288,34 @@ pub fn dashboard_json_scoped(registry: &Registry, scope_client_id: Option<u64>) 
             acc.1.saturating_add(flow.export_flow),
         )
     });
+    let health_clients: Vec<_> = scoped_clients
+        .iter()
+        .filter_map(|client| {
+            let health = client_health_summary(registry, &client.common.vkey, client);
+            if health["RuleCount"].as_u64().unwrap_or(0) == 0 {
+                return None;
+            }
+            Some(serde_json::json!({
+                "Id": client.id,
+                "Remark": &client.common.client.remark,
+                "VerifyKey": &client.common.vkey,
+                "Health": health,
+            }))
+        })
+        .collect();
+    let health_client_count = health_clients.len();
+    let health_rule_count = health_clients
+        .iter()
+        .map(|entry| entry["Health"]["RuleCount"].as_u64().unwrap_or(0) as usize)
+        .sum::<usize>();
+    let health_target_count = health_clients
+        .iter()
+        .map(|entry| entry["Health"]["UniqueTargetCount"].as_u64().unwrap_or(0) as usize)
+        .sum::<usize>();
+    let health_down_count = health_clients
+        .iter()
+        .map(|entry| entry["Health"]["DownCount"].as_u64().unwrap_or(0) as usize)
+        .sum::<usize>();
 
     let history = registry.system_history.lock().unwrap();
     let latest = history.back().cloned().unwrap_or_default();
@@ -3235,6 +3336,11 @@ pub fn dashboard_json_scoped(registry: &Registry, scope_client_id: Option<u64>) 
         "p2pCount": p2p_count,
         "inletFlowCount": inlet_flow_count,
         "exportFlowCount": export_flow_count,
+        "healthClientCount": health_client_count,
+        "healthRuleCount": health_rule_count,
+        "healthTargetCount": health_target_count,
+        "healthDownCount": health_down_count,
+        "healthClients": health_clients,
         "tcpCount": tcp_count,
         "cpu": latest.cpu,
         "virtual_mem": latest.virtual_mem,
@@ -3606,6 +3712,7 @@ pub fn client_rows(registry: &Arc<Registry>) -> Vec<serde_json::Value> {
                 "NowConn": client_now_conn(registry, &vkey),
                 "Status": info.status,
                 "IsConnect": online,
+                "Health": client_health_summary(registry, &vkey, config),
                 "NoStore": config.no_store,
                 "NoDisplay": config.no_display,
                 "MaxTunnelNum": info.max_tunnel_num,
@@ -3623,6 +3730,70 @@ pub fn client_rows(registry: &Arc<Registry>) -> Vec<serde_json::Value> {
             }))
         })
         .collect()
+}
+
+fn client_health_summary(
+    registry: &Registry,
+    vkey: &str,
+    config: &ClientRuntimeConfig,
+) -> serde_json::Value {
+    let removed_targets = registry
+        .health_targets
+        .lock()
+        .unwrap()
+        .get(vkey)
+        .cloned()
+        .unwrap_or_default();
+    let mut unique_targets = HashSet::new();
+    let mut rules = Vec::new();
+
+    for health in &config.healths {
+        let mut down_targets = Vec::new();
+        let mut up_targets = Vec::new();
+        for target in &health.targets {
+            unique_targets.insert(target.clone());
+            if removed_targets.contains(target) {
+                down_targets.push(target.clone());
+            } else {
+                up_targets.push(target.clone());
+            }
+        }
+        rules.push(serde_json::json!({
+            "Remark": &health.remark,
+            "Kind": &health.kind,
+            "IntervalSecs": health.interval_secs,
+            "TimeoutSecs": health.timeout_secs,
+            "MaxFailed": health.max_failed,
+            "HttpUrl": &health.http_url,
+            "Targets": &health.targets,
+            "DownTargets": down_targets,
+            "UpTargets": up_targets,
+        }));
+    }
+
+    let mut down_targets: Vec<_> = unique_targets
+        .iter()
+        .filter(|target| removed_targets.contains(*target))
+        .cloned()
+        .collect();
+    down_targets.sort();
+
+    let state = if config.healths.is_empty() {
+        "disabled"
+    } else if down_targets.is_empty() {
+        "healthy"
+    } else {
+        "degraded"
+    };
+
+    serde_json::json!({
+        "State": state,
+        "RuleCount": config.healths.len(),
+        "UniqueTargetCount": unique_targets.len(),
+        "DownCount": down_targets.len(),
+        "DownTargets": down_targets,
+        "Rules": rules,
+    })
 }
 
 fn update_client_last_online_addr(registry: &Arc<Registry>, vkey: &str, addr: &str) {
@@ -3742,6 +3913,7 @@ fn client_json(
         "Status": info.status,
         "IsConnect": online,
         "Cnf": { "U": info.basic_username, "P": info.basic_password, "Compress": info.compress, "Crypt": info.crypt },
+        "Health": client_health_summary(registry, vkey, config),
         "Flow": { "InletFlow": flow.inlet_flow, "ExportFlow": flow.export_flow, "FlowLimit": info.flow_limit_mb }
     })
 }
@@ -4489,6 +4661,7 @@ service manager."#
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::HealthCheck;
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::{CertificateDer, ServerName};
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -4774,6 +4947,84 @@ mod tests {
     }
 
     #[test]
+    fn health_removed_targets_are_skipped_when_selecting_runtime_targets() {
+        let root = temp_test_dir("rustnps-health-select");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        let target = Target {
+            target_str: "127.0.0.1:8081\n127.0.0.1:8082".to_string(),
+            ..Target::default()
+        };
+        registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .insert("health-vkey".to_string(), ["127.0.0.1:8081".to_string()].into_iter().collect());
+
+        let picked = pick_runtime_target(&registry, "health-vkey", &target, 0).unwrap();
+        assert_eq!(picked.0, "127.0.0.1:8082");
+
+        registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .insert(
+                "health-vkey".to_string(),
+                ["127.0.0.1:8081".to_string(), "127.0.0.1:8082".to_string()]
+                    .into_iter()
+                    .collect(),
+            );
+        assert!(pick_runtime_target(&registry, "health-vkey", &target, 0).is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn client_rows_and_dashboard_expose_health_summary() {
+        let root = temp_test_dir("rustnps-health-ui");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 909, "health-ui", false);
+
+        {
+            let mut clients = registry.clients.lock().unwrap();
+            let client = clients.get_mut("health-ui").unwrap();
+            client.healths = vec![HealthCheck {
+                remark: "backend".to_string(),
+                kind: "tcp".to_string(),
+                interval_secs: 5,
+                timeout_secs: 1,
+                max_failed: 2,
+                http_url: String::new(),
+                targets: vec!["127.0.0.1:8081".to_string(), "127.0.0.1:8082".to_string()],
+            }];
+        }
+        registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .insert("health-ui".to_string(), ["127.0.0.1:8081".to_string()].into_iter().collect());
+
+        let rows = client_rows(&registry);
+        let row = rows
+            .into_iter()
+            .find(|row| row["VerifyKey"] == "health-ui")
+            .unwrap();
+        assert_eq!(row["Health"]["State"], "degraded");
+        assert_eq!(row["Health"]["RuleCount"], 1);
+        assert_eq!(row["Health"]["UniqueTargetCount"], 2);
+        assert_eq!(row["Health"]["DownCount"], 1);
+        assert_eq!(row["Health"]["DownTargets"].as_array().unwrap().len(), 1);
+
+        let dashboard = serde_json::from_str::<serde_json::Value>(&dashboard_json_scoped(&registry, None)).unwrap();
+        assert_eq!(dashboard["healthClientCount"], 1);
+        assert_eq!(dashboard["healthRuleCount"], 1);
+        assert_eq!(dashboard["healthTargetCount"], 2);
+        assert_eq!(dashboard["healthDownCount"], 1);
+        assert_eq!(dashboard["healthClients"].as_array().unwrap().len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn stopping_tunnel_disconnects_tracked_live_connections() {
         let root = temp_test_dir("rustnps-stop-disconnect-live");
         let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
@@ -5024,6 +5275,172 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn https_host_proxy_e2e_succeeds_without_sni() {
+        let root = temp_test_dir("rustnps-https-host-e2e");
+        write_test_page_assets(&root);
+
+        let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+        let cert_der: CertificateDer<'static> = cert.cert.der().clone();
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend = thread::spawn(move || {
+            let (mut socket, _) = backend_listener.accept().unwrap();
+            let _ = read_http_head(&mut socket, 16 * 1024).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nbackend ok",
+                )
+                .unwrap();
+            socket.flush().unwrap();
+        });
+
+        let mut server = ServerConfig::default();
+        server.bridge_ip = "127.0.0.1".to_string();
+        server.bridge_port = free_tcp_port();
+        server.https_just_proxy = false;
+        let registry = Arc::new(Registry::new(server.clone(), PersistentStore::new(root.join("conf"))));
+
+        install_test_client(&registry, 909, "https-e2e", true);
+        let route = Host {
+            host: "localhost".to_string(),
+            scheme: "all".to_string(),
+            cert_file_path: cert_pem,
+            key_file_path: key_pem,
+            client_vkey: "https-e2e".to_string(),
+            target: Target {
+                target_str: backend_addr.to_string(),
+                local_proxy: false,
+            },
+            ..Host::default()
+        };
+        {
+            let mut clients = registry.clients.lock().unwrap();
+            let client = clients.get_mut("https-e2e").unwrap();
+            client.hosts.push(route.clone());
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        registry.controls.lock().unwrap().insert(
+            "https-e2e".to_string(),
+            ControlHandle {
+                tx,
+                version: VERSION.to_string(),
+                connected_at: SystemTime::now(),
+                remote_addr: "127.0.0.1:0".to_string(),
+            },
+        );
+
+        let registry_for_pending = Arc::clone(&registry);
+        let data_thread = thread::spawn(move || {
+            let ServerMessage::Open { link_id, .. } = rx.recv().unwrap() else {
+                panic!("expected open message");
+            };
+            let pair_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let pair_addr = pair_listener.local_addr().unwrap();
+            let client_side = TcpStream::connect(pair_addr).unwrap();
+            let (server_side, _) = pair_listener.accept().unwrap();
+            let pending = registry_for_pending.pending.lock().unwrap().remove(&link_id);
+            let tx = pending.expect("pending sender");
+            tx.send(Box::new(server_side)).unwrap();
+            handle_single_request_backend(Box::new(client_side), backend_addr.to_string()).unwrap();
+        });
+
+        let tls_config = build_tls_config_for_registry(&registry)
+            .unwrap()
+            .expect("tls config");
+        let registry_for_handler = Arc::clone(&registry);
+        let route_for_handler = route.clone();
+        let target_for_handler = backend_addr.to_string();
+        let response = replay_https_owned(
+            tls_config,
+            cert_der,
+            "localhost",
+            b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            move |mut socket| {
+                let head = read_http_head(&mut socket, 16 * 1024)?;
+                let (prepared_head, cache_key) = prepare_host_proxy_request(
+                    &registry_for_handler,
+                    &route_for_handler,
+                    "127.0.0.1:44444",
+                    &head,
+                    "https",
+                )
+                .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("prepare host proxy request failed: {:?}", err)))?;
+                proxy_host_request(
+                    &registry_for_handler,
+                    socket,
+                    route_for_handler.clone(),
+                    "127.0.0.1:44444".to_string(),
+                    target_for_handler,
+                    prepared_head,
+                    cache_key,
+                )
+            },
+        );
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.contains("HTTP/1.1 200 OK"), "unexpected https response: {text}");
+        assert!(text.contains("backend ok"), "unexpected https response body: {text}");
+
+        let _ = data_thread.join();
+        let _ = backend.join();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn handle_single_request_backend(mut stream: Box<dyn RelayStream>, target: String) -> io::Result<()> {
+        let head = read_http_head(&mut stream, 16 * 1024)?;
+        let mut backend = TcpStream::connect(target)?;
+        backend.write_all(&head)?;
+        backend.flush()?;
+
+        let mut response = Vec::new();
+        backend.read_to_end(&mut response)?;
+        stream.write_all(&response)?;
+        stream.flush()?;
+        if let Some(tcp) = stream.as_any().downcast_ref::<TcpStream>() {
+            let _ = tcp.shutdown(Shutdown::Write);
+        }
+        Ok(())
+    }
+    fn replay_https_owned<F>(
+        server_config: StdArc<rustls::ServerConfig>,
+        cert_der: CertificateDer<'static>,
+        server_name: &str,
+        request: &[u8],
+        handler: F,
+    ) -> Vec<u8>
+    where
+        F: FnOnce(rustls::StreamOwned<rustls::ServerConnection, TcpStream>) -> io::Result<()>
+            + Send
+            + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let tls = tls_handshake(socket, server_config).unwrap();
+            handler(tls).unwrap();
+        });
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = ServerName::try_from(server_name.to_string()).unwrap();
+        let conn = ClientConnection::new(StdArc::new(client_config), name).unwrap();
+        let socket = TcpStream::connect(addr).unwrap();
+        let mut client = StreamOwned::new(conn, socket);
+        client.write_all(request).unwrap();
+        client.flush().unwrap();
+        let response = read_replay_bytes(&mut client);
+        server.join().unwrap();
+        response
     }
 
     fn install_test_client(registry: &Arc<Registry>, id: u64, vkey: &str, no_store: bool) {

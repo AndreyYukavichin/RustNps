@@ -6,18 +6,20 @@ use crate::protocol::{
     ServerMessage,
 };
 use crate::relay::{
-    copy_bidirectional, http_header_value, parse_http_request_line, read_http_head,
+    copy_bidirectional, http_header_value, parse_http_request_line, parse_http_status_code,
+    read_http_head,
     wrap_client_transport, write_http_response, RelayStream,
 };
 use crate::{CORE_VERSION, VERSION};
+use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::io::{self, Read, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 struct Args {
@@ -120,6 +122,7 @@ fn run(args: Args) -> io::Result<()> {
                 config.common.tls_enable
             );
             send_config(&config)?;
+            start_health_monitor(config.clone());
             for local in config.local_servers.clone() {
                 start_local_server(config.common.server_addr.clone(), local);
             }
@@ -150,7 +153,150 @@ fn run(args: Args) -> io::Result<()> {
         "the version of client is {VERSION}, the core version of client is {CORE_VERSION},tls enable is {}",
         config.common.tls_enable
     );
+    start_health_monitor(config.clone());
     control_loop_with_reconnect(config)
+}
+
+fn start_health_monitor(config: ClientRuntimeConfig) {
+    if config.healths.is_empty() {
+        return;
+    }
+
+    let server_addr = config.common.server_addr.clone();
+    let vkey = config.common.vkey.clone();
+    let healths = config.healths.clone();
+    crate::log_info!("npc", "health monitor enabled, rules={}", healths.len());
+
+    thread::spawn(move || {
+        let mut failure_counts: HashMap<usize, HashMap<String, u32>> = HashMap::new();
+        let mut next_checks: HashMap<usize, Instant> = HashMap::new();
+
+        loop {
+            let now = Instant::now();
+            let mut next_wait = Duration::from_secs(1);
+
+            for (index, health) in healths.iter().enumerate() {
+                if health.interval_secs == 0 || health.timeout_secs == 0 || health.max_failed == 0 {
+                    continue;
+                }
+
+                let interval = Duration::from_secs(health.interval_secs.max(1));
+                let next_check = next_checks.entry(index).or_insert(now);
+                if now >= *next_check {
+                    let per_health = failure_counts.entry(index).or_default();
+                    for target in &health.targets {
+                        let ok = probe_health_target(health, target);
+                        let failures = per_health.entry(target.clone()).or_insert(0);
+                        if ok {
+                            if *failures >= health.max_failed {
+                                if let Err(err) = report_health_change(&server_addr, &vkey, target, true) {
+                                    crate::log_trace!(
+                                        "npc",
+                                        "health restore report failed vkey={} target={} err={}",
+                                        vkey,
+                                        target,
+                                        err
+                                    );
+                                    continue;
+                                }
+                            }
+                            *failures = 0;
+                        } else {
+                            *failures = failures.saturating_add(1);
+                            if *failures % health.max_failed == 0 {
+                                if let Err(err) = report_health_change(&server_addr, &vkey, target, false) {
+                                    crate::log_trace!(
+                                        "npc",
+                                        "health remove report failed vkey={} target={} err={}",
+                                        vkey,
+                                        target,
+                                        err
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    *next_check = now + interval;
+                }
+
+                let wait = next_check.saturating_duration_since(now);
+                if wait < next_wait {
+                    next_wait = wait;
+                }
+            }
+
+            thread::sleep(next_wait.max(Duration::from_millis(100)));
+        }
+    });
+}
+
+fn report_health_change(
+    server_addr: &str,
+    vkey: &str,
+    target: &str,
+    status: bool,
+) -> io::Result<()> {
+    let mut stream = TcpStream::connect(server_addr)?;
+    let hello = BridgeHello::Health {
+        vkey: vkey.to_string(),
+        target: target.to_string(),
+        status,
+    };
+    write_message(&mut stream, &hello)?;
+    match read_message::<ServerMessage>(&mut stream)? {
+        ServerMessage::Ok { .. } => Ok(()),
+        ServerMessage::Error { message } => Err(io::Error::new(io::ErrorKind::Other, message)),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected health response: {other:?}"),
+        )),
+    }
+}
+
+fn probe_health_target(health: &crate::model::HealthCheck, target: &str) -> bool {
+    let timeout = Duration::from_secs(health.timeout_secs.max(1));
+    match health.kind.to_ascii_lowercase().as_str() {
+        "http" => probe_http_health_target(target, &health.http_url, timeout),
+        _ => probe_tcp_health_target(target, timeout),
+    }
+}
+
+fn probe_tcp_health_target(target: &str, timeout: Duration) -> bool {
+    let Ok(mut addrs) = target.to_socket_addrs() else {
+        return false;
+    };
+    let Some(addr) = addrs.next() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&addr, timeout).is_ok()
+}
+
+fn probe_http_health_target(target: &str, http_url: &str, timeout: Duration) -> bool {
+    let Ok(mut addrs) = target.to_socket_addrs() else {
+        return false;
+    };
+    let Some(addr) = addrs.next() else {
+        return false;
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let path = if http_url.starts_with('/') {
+        http_url.to_string()
+    } else {
+        format!("/{http_url}")
+    };
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    if stream.read_to_end(&mut response).is_err() {
+        return false;
+    }
+    parse_http_status_code(&response) == Some(200)
 }
 
 fn control_loop_with_reconnect(config: ClientRuntimeConfig) -> io::Result<()> {
@@ -458,6 +604,7 @@ fn serve_link(stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
                     return Err(err);
                 }
             };
+            write_proxy_protocol_if_needed(&mut target, &link.proto_version, &link.remote_addr)?;
             crate::log_debug!(
                 "npc",
                 "serve_link http forwarding request head bytes={} target={} remote={}",
@@ -512,9 +659,93 @@ fn serve_link(stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
                     return Err(err);
                 }
             };
+            let mut target = target;
+            write_proxy_protocol_if_needed(&mut target, &link.proto_version, &link.remote_addr)?;
             copy_bidirectional(stream, target)
         }
     }
+}
+
+fn write_proxy_protocol_if_needed(
+    target: &mut TcpStream,
+    proto_version: &str,
+    remote_addr: &str,
+) -> io::Result<()> {
+    let version = proto_version.trim().to_ascii_uppercase();
+    if version.is_empty() {
+        return Ok(());
+    }
+
+    let remote = match remote_addr.parse::<SocketAddr>() {
+        Ok(addr) => addr,
+        Err(_) => return Ok(()),
+    };
+    let local = target.local_addr()?;
+
+    match version.as_str() {
+        "V1" => write_proxy_protocol_v1(target, remote, local),
+        "V2" => write_proxy_protocol_v2(target, remote, local),
+        _ => Ok(()),
+    }
+}
+
+fn write_proxy_protocol_v1(
+    target: &mut TcpStream,
+    remote: SocketAddr,
+    local: SocketAddr,
+) -> io::Result<()> {
+    let header = match (remote.ip(), local.ip()) {
+        (IpAddr::V4(source_ip), IpAddr::V4(destination_ip)) => format!(
+            "PROXY TCP4 {} {} {} {}\r\n",
+            source_ip,
+            destination_ip,
+            remote.port(),
+            local.port()
+        ),
+        (IpAddr::V6(source_ip), IpAddr::V6(destination_ip)) => format!(
+            "PROXY TCP6 {} {} {} {}\r\n",
+            source_ip,
+            destination_ip,
+            remote.port(),
+            local.port()
+        ),
+        _ => return Ok(()),
+    };
+    target.write_all(header.as_bytes())
+}
+
+fn write_proxy_protocol_v2(
+    target: &mut TcpStream,
+    remote: SocketAddr,
+    local: SocketAddr,
+) -> io::Result<()> {
+    const SIGNATURE: [u8; 12] = [0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a];
+
+    let mut frame = Vec::with_capacity(52);
+    frame.extend_from_slice(&SIGNATURE);
+    frame.push(0x21);
+
+    match (remote.ip(), local.ip()) {
+        (IpAddr::V4(source_ip), IpAddr::V4(destination_ip)) => {
+            frame.push(0x11);
+            frame.extend_from_slice(&(12_u16).to_be_bytes());
+            frame.extend_from_slice(&source_ip.octets());
+            frame.extend_from_slice(&destination_ip.octets());
+            frame.extend_from_slice(&remote.port().to_be_bytes());
+            frame.extend_from_slice(&local.port().to_be_bytes());
+        }
+        (IpAddr::V6(source_ip), IpAddr::V6(destination_ip)) => {
+            frame.push(0x21);
+            frame.extend_from_slice(&(36_u16).to_be_bytes());
+            frame.extend_from_slice(&source_ip.octets());
+            frame.extend_from_slice(&destination_ip.octets());
+            frame.extend_from_slice(&remote.port().to_be_bytes());
+            frame.extend_from_slice(&local.port().to_be_bytes());
+        }
+        _ => return Ok(()),
+    }
+
+    target.write_all(&frame)
 }
 
 fn serve_udp(mut stream: Box<dyn RelayStream>, link: Link) -> io::Result<()> {
@@ -968,6 +1199,87 @@ Examples:
   npc register -server 127.0.0.1:8024 -vkey 123 -time 2
   npc -server 127.0.0.1:8024 -password ssh2 -local_type secret -local_port 2001"#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{report_health_change, write_proxy_protocol_v1, write_proxy_protocol_v2};
+    use crate::protocol::{ok, read_message, write_message, BridgeHello};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
+
+    #[test]
+    fn proxy_protocol_v1_writes_text_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            socket.read_to_end(&mut buf).unwrap();
+            String::from_utf8(buf).unwrap()
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let remote = "127.0.0.1:43210".parse().unwrap();
+        let local = stream.local_addr().unwrap();
+        write_proxy_protocol_v1(&mut stream, remote, local).unwrap();
+        stream.write_all(b"hello").unwrap();
+        stream.flush().unwrap();
+        drop(stream);
+
+        let captured = server.join().unwrap();
+        assert!(captured.starts_with("PROXY TCP4 127.0.0.1 127.0.0.1 43210 "));
+        assert!(captured.ends_with("\r\nhello"));
+    }
+
+    #[test]
+    fn proxy_protocol_v2_writes_binary_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut buf = Vec::new();
+            socket.read_to_end(&mut buf).unwrap();
+            buf
+        });
+
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let remote = "127.0.0.1:43210".parse().unwrap();
+        let local = stream.local_addr().unwrap();
+        write_proxy_protocol_v2(&mut stream, remote, local).unwrap();
+        stream.write_all(b"hello").unwrap();
+        drop(stream);
+
+        let captured = server.join().unwrap();
+        assert_eq!(&captured[..12], b"\r\n\r\n\0\r\nQUIT\n");
+        assert_eq!(captured[12], 0x21);
+        assert_eq!(captured[13], 0x11);
+        assert_eq!(u16::from_be_bytes([captured[14], captured[15]]), 12);
+        assert_eq!(&captured[captured.len() - 5..], b"hello");
+    }
+
+    #[test]
+    fn report_health_change_sends_health_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let hello: BridgeHello = read_message(&mut socket).unwrap();
+            match hello {
+                BridgeHello::Health { vkey, target, status } => {
+                    assert_eq!(vkey, "health-vkey");
+                    assert_eq!(target, "127.0.0.1:8081");
+                    assert!(!status);
+                    write_message(&mut socket, &ok("health accepted")).unwrap();
+                }
+                other => panic!("unexpected hello: {other:?}"),
+            }
+        });
+
+        report_health_change(&addr.to_string(), "health-vkey", "127.0.0.1:8081", false).unwrap();
+        server.join().unwrap();
+    }
 }
 
 fn empty_to<'a>(value: &'a str, default: &'a str) -> &'a str {

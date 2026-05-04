@@ -26,6 +26,11 @@ pub enum BridgeHello {
         core_version: String,
         config: ClientRuntimeConfig,
     },
+    Health {
+        vkey: String,
+        target: String,
+        status: bool,
+    },
     Data {
         vkey: String,
         link_id: u64,

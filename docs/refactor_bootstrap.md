@@ -1,0 +1,20 @@
+# Refactor Bootstrap
+
+这份文档给下一步代码重构一个最小启动面，避免后续工作继续散落在口头清单里。
+
+## Phase 1
+
+- 先把 P0 缺口做成独立测试或显式 stub。
+- 每个缺口都要有一个可运行检查，避免后续重构时再次回退。
+- 优先顺序：KCP -> Proxy Protocol -> Health Check。
+
+## Phase 2
+
+- 把任务生命周期收敛到统一入口。
+- 将 add/edit/del/start/stop 的 side effects 从 Web 层剥离到 server 层。
+- 保持现有接口不变，只调整内部 orchestration。
+
+## Phase 3
+
+
+- 最后统一整理 README、feature_map 和 todo 文档，保证文档和代码保持同步。

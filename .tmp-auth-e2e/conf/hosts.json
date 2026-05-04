@@ -1,2 +1,2 @@
-{"id":3,"host":"192.168.100.191","header_change":"","host_change":"","location":"/","remark":"auth-host","scheme":"all","cert_file_path":"","key_file_path":"","target":{"target_str":"127.0.0.1:28090","local_proxy":false},"client_vkey":"authdemo","no_store":false,"is_close":false,"auto_https":false}
+{"id":3,"host":"localhost","header_change":"","host_change":"","location":"/","remark":"auth-host","scheme":"all","cert_file_path":"c:/Users/yonghu/Desktop/nps_reconstruct_rust/RustNps/.tmp-auth-e2e/certs/host-cert.pem","key_file_path":"c:/Users/yonghu/Desktop/nps_reconstruct_rust/RustNps/.tmp-auth-e2e/certs/host-key.pem","target":{"target_str":"127.0.0.1:28090","local_proxy":false},"client_vkey":"authdemo","no_store":false,"is_close":false,"auto_https":false}
 *#*

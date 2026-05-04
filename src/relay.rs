@@ -47,6 +47,25 @@ impl IntoIoHalves for Box<dyn RelayStream> {
     }
 }
 
+impl IntoIoHalves for rustls::StreamOwned<ServerConnection, TcpStream> {
+    fn into_io_halves(self) -> io::Result<(Box<dyn RelayRead>, Box<dyn RelayWrite>)> {
+        let rustls::StreamOwned { conn, sock } = self;
+        let reader = sock.try_clone()?;
+        let shared = Arc::new(TlsSharedState {
+            conn: Mutex::new(TlsConnection::Server(conn)),
+            reader: Mutex::new(Box::new(TcpReadHalf { inner: reader })),
+            writer: Mutex::new(Box::new(TcpWriteHalf { inner: sock })),
+        });
+        flush_pending_tls(&shared)?;
+        Ok((
+            Box::new(TlsReadHalf {
+                shared: Arc::clone(&shared),
+            }),
+            Box::new(TlsWriteHalf { shared }),
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TransportSide {
     Client,
