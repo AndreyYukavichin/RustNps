@@ -1292,7 +1292,7 @@ fn start_http_proxy_listener(
                     return;
                 }
             };
-            let Some((target, is_connect)) = parse_http_target(&head) else {
+            let Some((mut target, mut is_connect)) = parse_http_target(&head) else {
                 let _ = write_http_response(
                     &mut inbound,
                     "400 Bad Request",
@@ -1301,6 +1301,16 @@ fn start_http_proxy_listener(
                 );
                 return;
             };
+
+            // If tunnel has a target configured, we override the request's destination (Relay mode)
+            if !tunnel.target.target_str.trim().is_empty() {
+                let cursor_key = format!("http_relay:{}:{}", tunnel.client_vkey, tunnel.remark);
+                if let Some(relay_target) = select_target(&registry, &cursor_key, &tunnel) {
+                    target = relay_target;
+                    is_connect = false; // We treat it as a relay, not a tunnel
+                }
+            }
+
             if let Some((method, path, _)) = parse_http_request_line(&head) {
                 let host = http_header_value(&head, "Host").unwrap_or_else(|| target.clone());
                 crate::log_info!(

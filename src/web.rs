@@ -939,7 +939,7 @@ fn render_tunnel_fields(registry: &Registry, session: &WebSession, kind: &str, i
     let proto_v2 = selected(&tunnel.proto_version, "V2");
     let proto_empty = if tunnel.proto_version.trim().is_empty() { "selected" } else { "" };
     let server_ip_field = if registry.server.allow_multi_ip {
-        format!(r#"<div class="form-group"><label langtag="word-serverip"></label><input class="form-control" name="server_ip" value="{}"></div>"#, html_escape(&tunnel.server_ip))
+        format!(r#"<div class="form-group" id="server_ip_group"><label langtag="word-serverip"></label><input class="form-control" name="server_ip" value="{}"></div>"#, html_escape(&tunnel.server_ip))
     } else {
         String::new()
     };
@@ -955,8 +955,8 @@ fn render_tunnel_fields(registry: &Registry, session: &WebSession, kind: &str, i
     let sel_secret = selected(&kind, "secret");
     let sel_p2p = selected(&kind, "p2p");
 
-    format!(
-        r#"<div class="form-group"><label langtag="word-scheme"></label><select class="form-control" name="type"><option value="tcp" {sel_tcp} langtag="scheme-tcp"></option><option value="udp" {sel_udp} langtag="scheme-udp"></option><option value="httpProxy" {sel_http} langtag="scheme-httpproxy"></option><option value="socks5" {sel_socks5} langtag="scheme-socks5"></option><option value="secret" {sel_secret} langtag="scheme-secret"></option><option value="p2p" {sel_p2p} langtag="scheme-p2p"></option></select></div>{client_field}<div class="form-group"><label langtag="word-remark"></label><input class="form-control" name="remark" value="{remark}"></div>{server_ip_field}<div class="form-group"><label langtag="word-port"></label><input class="form-control" name="port" value="{port}"></div>{local_proxy_field}<div class="form-group"><label langtag="word-target"></label><textarea class="form-control" rows="4" name="target">{target}</textarea></div><div class="form-group"><label langtag="word-identificationkey"></label><input class="form-control" name="password" value="{password}"></div><div class="form-group"><label>Local path</label><input class="form-control" name="local_path" value="{local_path}"></div><div class="form-group"><label>Strip prefix</label><input class="form-control" name="strip_pre" value="{strip_pre}"></div><div class="form-group"><label>Proxy Protocol Version</label><select class="form-control" name="proto_version"><option value="" {proto_empty}></option><option value="V1" {proto_v1}>V1</option><option value="V2" {proto_v2}>V2</option></select></div>"#,
+    let mut fields = format!(
+        r#"<div class="form-group"><label langtag="word-scheme"></label><select class="form-control" name="type" id="scheme_type"><option value="tcp" {sel_tcp} langtag="scheme-tcp"></option><option value="udp" {sel_udp} langtag="scheme-udp"></option><option value="httpProxy" {sel_http} langtag="scheme-httpproxy"></option><option value="socks5" {sel_socks5} langtag="scheme-socks5"></option><option value="secret" {sel_secret} langtag="scheme-secret"></option><option value="p2p" {sel_p2p} langtag="scheme-p2p"></option></select></div>{client_field}<div class="form-group"><label langtag="word-remark"></label><input class="form-control" name="remark" value="{remark}"></div>{server_ip_field}<div class="form-group" id="port_group"><label langtag="word-port"></label><input class="form-control" name="port" value="{port}" placeholder="留空自动生成"></div><div class="form-group" id="local_proxy_group"><label langtag="word-proxytolocal"></label><select class="form-control" name="local_proxy"><option value="0" {local_proxy_no} langtag="word-no"></option><option value="1" {local_proxy_yes} langtag="word-yes"></option></select></div><div class="form-group" id="target_group"><label langtag="word-target"></label><textarea class="form-control" rows="4" name="target">{target}</textarea></div><div class="form-group" id="password_group"><label langtag="word-identificationkey"></label><input class="form-control" name="password" value="{password}"></div><div class="form-group" id="local_path_group"><label>Local path</label><input class="form-control" name="local_path" value="{local_path}"></div><div class="form-group" id="strip_pre_group"><label>Strip prefix</label><input class="form-control" name="strip_pre" value="{strip_pre}"></div><div class="form-group" id="proto_group"><label>Proxy Protocol Version</label><select class="form-control" name="proto_version"><option value="" {proto_empty}></option><option value="V1" {proto_v1}>V1</option><option value="V2" {proto_v2}>V2</option></select></div><script>(function(){{function sync(){{var mode=$('#scheme_type').val();$('#local_proxy_group').toggle(mode==='tcp'||mode==='udp');$('#target_group').toggle(mode!=='socks5'&&mode!=='httpProxy');$('#password_group').toggle(mode==='secret'||mode==='p2p');$('#local_path_group').toggle(mode==='file');$('#strip_pre_group').toggle(mode==='file');$('#proto_group').toggle(mode==='tcp');$('#server_ip_group').toggle(mode!=='socks5'&&mode!=='httpProxy');}}$('#scheme_type').on('change',sync);sync();}})();</script>"#,
         sel_tcp = sel_tcp,
         sel_udp = sel_udp,
         sel_http = sel_http,
@@ -966,7 +966,8 @@ fn render_tunnel_fields(registry: &Registry, session: &WebSession, kind: &str, i
         client_field = client_field,
         server_ip_field = server_ip_field,
         port = html_escape(&port_value),
-        local_proxy_field = local_proxy_field,
+        local_proxy_no = local_proxy_no,
+        local_proxy_yes = local_proxy_yes,
         target = html_escape(&tunnel.target.target_str),
         remark = html_escape(&tunnel.remark),
         password = html_escape(&tunnel.password),
@@ -975,7 +976,8 @@ fn render_tunnel_fields(registry: &Registry, session: &WebSession, kind: &str, i
         proto_empty = proto_empty,
         proto_v1 = proto_v1,
         proto_v2 = proto_v2,
-    )
+    );
+    fields
 }
 
 fn render_client_binding_field(
