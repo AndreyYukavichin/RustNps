@@ -55,9 +55,7 @@ jobs:
             RAW_TAG="${GITHUB_REF_NAME#v}"
             TAGS=$(printf '%s\n%s:%s' "${TAGS}" "${IMAGE}" "${RAW_TAG}")
 
-            IFS='.' read -r major minor patch <<EOF
-${RAW_TAG}
-EOF
+            IFS='.' read -r major minor patch <<< "${RAW_TAG}"
             if [ -n "${major:-}" ]; then
               TAGS=$(printf '%s\n%s:%s' "${TAGS}" "${IMAGE}" "${major}")
             fi
