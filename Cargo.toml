@@ -33,5 +33,6 @@ rustls = "0.23"
 rustls-pemfile = "2"
 snap = "1"
 rcgen = "0.13"
+kcp-io = "0.0.4"
 
 [dev-dependencies]

@@ -1,6 +1,5 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, Weak};
@@ -8,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::model::FlowCounter;
-use crate::relay::{RelayRead, RelayStream, RelayWrite};
+use crate::relay::{IntoIoHalves, RelayRead, RelayStream, RelayWrite};
 
 const FRAME_OPEN: u8 = 1;
 const FRAME_DATA: u8 = 2;
@@ -29,7 +28,7 @@ pub struct MuxTrafficPolicy {
 }
 
 struct MuxSessionInner {
-    writer: Mutex<TcpStream>,
+    writer: Mutex<Box<dyn RelayWrite>>,
     streams: Mutex<HashMap<u64, Sender<Option<Vec<u8>>>>>,
     accept_tx: Sender<MuxStream>,
     closed: AtomicBool,
@@ -53,12 +52,18 @@ pub struct MuxStream {
 }
 
 impl MuxSession {
-    pub fn new(stream: TcpStream) -> io::Result<Arc<Self>> {
+    pub fn new<S>(stream: S) -> io::Result<Arc<Self>>
+    where
+        S: IntoIoHalves + Send + 'static,
+    {
         Self::new_with_policy(stream, MuxTrafficPolicy::default())
     }
 
-    pub fn new_with_policy(stream: TcpStream, policy: MuxTrafficPolicy) -> io::Result<Arc<Self>> {
-        let reader = stream.try_clone()?;
+    pub fn new_with_policy<S>(stream: S, policy: MuxTrafficPolicy) -> io::Result<Arc<Self>>
+    where
+        S: IntoIoHalves + Send + 'static,
+    {
+        let (reader, writer) = stream.into_io_halves()?;
         let (accept_tx, accept_rx) = mpsc::channel();
         let traffic = policy.flow_counter.map(|counter| MuxTrafficState {
             limiter: (policy.rate_limit_kb > 0)
@@ -68,7 +73,7 @@ impl MuxSession {
         });
         let session = Arc::new(Self {
             inner: Arc::new(MuxSessionInner {
-                writer: Mutex::new(stream),
+                writer: Mutex::new(writer),
                 streams: Mutex::new(HashMap::new()),
                 accept_tx,
                 closed: AtomicBool::new(false),
@@ -402,27 +407,16 @@ impl Drop for MuxStream {
     }
 }
 
-fn read_loop(mut reader: TcpStream, session: Weak<MuxSessionInner>) {
-    let local_addr = reader.local_addr().map(|a| a.to_string()).unwrap_or_default();
-    let peer_addr = reader.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-
+fn read_loop(mut reader: Box<dyn RelayRead>, session: Weak<MuxSessionInner>) {
     loop {
         let mut header = [0_u8; HEADER_LEN];
         if let Err(err) = reader.read_exact(&mut header) {
             if err.kind() == io::ErrorKind::UnexpectedEof {
                 crate::log_debug!("npc", "mux: read session unpack from connection err EOF");
             } else if err.kind() == io::ErrorKind::TimedOut || err.kind() == io::ErrorKind::WouldBlock {
-                crate::log_debug!(
-                    "npc",
-                    "mux: read session unpack from connection err read tcp {}->{}: read: connection timed out",
-                    local_addr, peer_addr
-                );
+                crate::log_debug!("npc", "mux: read session unpack from connection err timeout");
             } else {
-                crate::log_debug!(
-                    "npc",
-                    "mux: read session unpack from connection err read tcp {}->{}: {}",
-                    local_addr, peer_addr, err
-                );
+                crate::log_debug!("npc", "mux: read session unpack from connection err {}", err);
             }
             break;
         }
@@ -443,17 +437,9 @@ fn read_loop(mut reader: TcpStream, session: Weak<MuxSessionInner>) {
                 if err.kind() == io::ErrorKind::UnexpectedEof {
                     crate::log_debug!("npc", "mux: read session unpack from connection err EOF");
                 } else if err.kind() == io::ErrorKind::TimedOut || err.kind() == io::ErrorKind::WouldBlock {
-                    crate::log_debug!(
-                        "npc",
-                        "mux: read session unpack from connection err read tcp {}->{}: read: connection timed out",
-                        local_addr, peer_addr
-                    );
+                    crate::log_debug!("npc", "mux: read session unpack from connection err timeout");
                 } else {
-                    crate::log_debug!(
-                        "npc",
-                        "mux: read session unpack from connection err read tcp {}->{}: {}",
-                        local_addr, peer_addr, err
-                    );
+                    crate::log_debug!("npc", "mux: read session unpack from connection err {}", err);
                 }
                 break;
             }

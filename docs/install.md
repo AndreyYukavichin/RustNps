@@ -138,6 +138,10 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 交叉编译过程中若遇到依赖的 C 库（如 OpenSSL），需要为目标平台准备相应的交叉链接库与头文件。
 
+## Docker（可选）
+
+如果你更倾向容器部署，可以直接查看 [docker.md](docker.md)，其中包含本仓库的 Docker 镜像构建与 Docker Hub 发布说明。
+
 ---
 
 ## 常见问题与排查

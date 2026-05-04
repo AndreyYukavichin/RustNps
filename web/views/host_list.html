@@ -3,7 +3,7 @@
 <div class="content"><div class="table-responsive"><div id="toolbar"><a href="{{base}}/index/addhost?client_id={{client_id}}" class="btn btn-primary dim"><i class="fa fa-fw fa-lg fa-plus"></i> <span langtag="word-add"></span></a></div><table id="table"></table></div></div>
 </div></div></div></div>
 <script>
-$("#table").bootstrapTable({
+var hostListTableOptions = window.npsTableState ? window.npsTableState.bootstrapOptions('host-list-{{client_id}}', {
     toolbar:"#toolbar", method:"post", url:"{{base}}/index/hostlist", contentType:"application/x-www-form-urlencoded",
     queryParams:function(params){ return {offset:params.offset, limit:params.limit, client_id:"{{client_id}}", search:params.search}; },
     striped:true, search:true, showHeader:true, showColumns:true, showRefresh:true, pagination:true, sidePagination:"server", pageList:[5,10,20,50], detailView:true, onPostBody:function(){ $("body").setLang("#table"); },
@@ -26,5 +26,29 @@ $("#table").bootstrapTable({
             return btn;
         }}
     ]
-});
+}) : {
+    toolbar:"#toolbar", method:"post", url:"{{base}}/index/hostlist", contentType:"application/x-www-form-urlencoded",
+    queryParams:function(params){ return {offset:params.offset, limit:params.limit, client_id:"{{client_id}}", search:params.search}; },
+    striped:true, search:true, showHeader:true, showColumns:true, showRefresh:true, pagination:true, sidePagination:"server", pageList:[5,10,20,50], detailView:true, onPostBody:function(){ $("body").setLang("#table"); },
+    detailFormatter:function(index,row){ return '<b langtag="word-requestheader"></b>: '+row.HeaderChange+'&emsp;<br><b langtag="word-requesthost"></b>: '+row.HostChange; },
+    columns:[
+        {field:"Id", title:'<span langtag="word-id"></span>'},
+        {field:"ClientId", title:'<span langtag="word-clientid"></span>', formatter:function(v,row){ return row.Client.Id+"-"+row.Client.Remark; }},
+        {field:"Remark", title:'<span langtag="word-remark"></span>'},
+        {field:"Host", title:'<span langtag="word-host"></span>', formatter:function(v,row){ return '<a href="http://'+row.Host+'" target="_blank">'+row.Host+'</a>'; }},
+        {field:"Scheme", title:'<span langtag="word-scheme"></span>'},
+        {field:"Target", title:'<span langtag="word-target"></span>', formatter:function(v,row){ return row.Target.TargetStr; }},
+        {field:"Location", title:'<span langtag="word-location"></span>'},
+        {field:"IsClose", title:'<span langtag="word-status"></span>', formatter:function(v){ return !v ? '<span class="badge badge-primary" langtag="word-open"></span>' : '<span class="badge badge-badge" langtag="word-close"></span>'; }},
+        {field:"ClientStatus", title:'<span langtag="word-clientstatus"></span>', formatter:function(v,row){ return row.Client.IsConnect ? '<span class="badge badge-primary" langtag="word-online"></span>' : '<span class="badge badge-badge" langtag="word-offline"></span>'; }},
+        {field:"option", title:'<span langtag="word-option"></span>', formatter:function(v,row){
+            let btn='<div class="btn-group">';
+            btn += !row.IsClose ? '<a onclick="submitform(\'stop\', \'{{base}}/index/hoststop\', {id:'+row.Id+'})" class="btn btn-outline btn-warning"><i class="fa fa-pause"></i></a>' : '<a onclick="submitform(\'start\', \'{{base}}/index/hoststart\', {id:'+row.Id+'})" class="btn btn-outline btn-primary"><i class="fa fa-play"></i></a>';
+            btn += '<a onclick="submitform(\'delete\', \'{{base}}/index/delhost\', {id:'+row.Id+'})" class="btn btn-outline btn-danger"><i class="fa fa-trash"></i></a>';
+            btn += '<a href="{{base}}/index/edithost?id='+row.Id+'" class="btn btn-outline btn-success"><i class="fa fa-edit"></i></a></div>';
+            return btn;
+        }}
+    ]
+};
+$("#table").bootstrapTable(hostListTableOptions);
 </script>

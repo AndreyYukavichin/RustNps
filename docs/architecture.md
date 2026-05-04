@@ -10,6 +10,7 @@ RustNps 架构概览
 - 管理层（Web UI / API）
   - 负责用户认证、展示系统/客户端/隧道信息、触发运行时操作（启动/停止/删除）等。
   - 主要实现：`src/web.rs`（路由与渲染）、`web/views/`（模板）、`web/static/`（静态资源）。
+  - Dashboard 数据由 `dashboard_json_scoped` 统一聚合，列表页的分页、搜索、排序和列显示状态由前端本地状态恢复逻辑回填。
 
 - 控制面（Control Plane）
   - 负责客户端注册、隧道安装、配置下发、控制消息的收发与会话维护。
@@ -44,7 +45,7 @@ RustNps 架构概览
 1. 客户端与服务端建立 bridge 连接并发送 `BridgeHello::Control` 或 `BridgeHello::Mux`。
 2. 服务端在 `handle_bridge_conn` 中处理控制消息、创建 `ControlHandle` 或 `MuxSession` 并存入 `Registry::controls`/`Registry::mux_sessions`。
 3. 当客户端发送 `BridgeHello::Config`（带 tunnels/hosts）时，服务端调用 `install_client_config`：分配 id、校验、调用 `expand_runtime_tunnels` 并将监听器（listener）传给 `start_*_listener` 启动 data plane。
-4. Web UI 通过 API（例如 `/index/gettunnel`）读取 `Registry` 中的 `clients`/`tunnels` 信息并渲染到页面；发起操作时调用服务端 mutation 接口（POST），服务端修改 `Registry` 并持久化到 `PersistentStore`（如果需要）。
+4. Web UI 通过 API（例如 `/index/gettunnel`、`/api/dashboard`）读取 `Registry` 中的 `clients`/`tunnels`/聚合指标并渲染到页面；发起操作时调用服务端 mutation 接口（POST），服务端修改 `Registry` 并在需要时持久化到 `PersistentStore`。
 
 网络与安全
 ----------

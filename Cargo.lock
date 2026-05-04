@@ -507,6 +507,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcp-io"
+version = "0.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d837be008f70143d33227af1ddead36a412dd047a34c0f21c5000c4a7f8635aa"
+dependencies = [
+ "bytes",
+ "cc",
+ "log",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -803,6 +816,7 @@ dependencies = [
  "axum-extra",
  "base64",
  "chrono",
+ "kcp-io",
  "md5",
  "rcgen",
  "rustls",
@@ -985,6 +999,26 @@ dependencies = [
  "once_cell",
  "rayon",
  "windows",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+dependencies = [
+ "thiserror-impl",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

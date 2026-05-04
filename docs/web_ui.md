@@ -20,8 +20,8 @@ RustNps 自带一个轻量的 Web 管理页，便于查看客户端/隧道状态
 常用页面概览
 -----------
 - Dashboard（`/` 或 `/index/index`）
-  - 显示系统负载、CPU、内存、带宽、以及客户端/隧道的一些统计。
-  - API：`/api/dashboard`（返回 `SystemSnapshot` 序列和汇总数据）。
+  - 显示系统负载、CPU、内存、带宽、以及客户端/隧道/health/lifecycle 的聚合统计。
+  - API：`/api/dashboard`（返回 `SystemSnapshot` 序列、聚合卡片数据和 health 汇总）。
 - Client List（`/client/list`）
   - 显示已注册客户端的表格（VKey、Remark、在线状态、Addr、InletFlow/ExportFlow 等）。
   - API：`/client/list`（GET 页面，POST 返回表格数据）。
@@ -34,7 +34,7 @@ RustNps 自带一个轻量的 Web 管理页，便于查看客户端/隧道状态
 前端实现要点
 -------------
 - 模板渲染：函数 `load_view` 从 `web/views` 读取 HTML 模板，并用 `{{key}}` 占位替换变量（参见 `render_layout` 的 `vars`）。
-- 表格与交互：采用 `bootstrap-table`、`jQuery` 和 `echarts`。Dashboard 的数据由 `/api/dashboard` 周期性轮询并刷新图表/进度条。
+- 表格与交互：采用 `bootstrap-table`、`jQuery` 和 `echarts`。Dashboard 的数据由 `/api/dashboard` 周期性轮询并刷新图表/进度条，列表页会用 `web/static/js/table-state.js` 记住分页、搜索、排序和列显示状态。
 - 内存显示修复：Dashboard 模块使用服务器返回的 `total_mem` 与 `virtual_mem` 计算占用百分比并格式化为 GB/MB，两位小数显示。参考视图代码： [web/views/dashboard.html](web/views/dashboard.html)
 
 修改表单字段（例如添加 `模式` 下拉）

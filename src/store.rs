@@ -257,6 +257,7 @@ fn decode_host(value: Value) -> io::Result<Host> {
     host.scheme = value_string(&value, "Scheme");
     host.cert_file_path = value_string(&value, "CertFilePath");
     host.key_file_path = value_string(&value, "KeyFilePath");
+    host.proto_version = value_string(&value, "ProtoVersion");
     host.no_store = value_bool(&value, "NoStore", false);
     host.is_close = value_bool(&value, "IsClose", false);
     host.auto_https = value_bool(&value, "AutoHttps", false);

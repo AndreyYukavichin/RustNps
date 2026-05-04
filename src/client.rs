@@ -1,3 +1,4 @@
+use crate::bridge_transport::{connect_bridge_stream, BridgeMode};
 use crate::config::load_client_config;
 use crate::model::{ClientRuntimeConfig, LocalServer};
 use crate::mux::MuxSession;
@@ -7,8 +8,7 @@ use crate::protocol::{
 };
 use crate::relay::{
     copy_bidirectional, http_header_value, parse_http_request_line, parse_http_status_code,
-    read_http_head,
-    wrap_client_transport, write_http_response, RelayStream,
+    read_http_head, wrap_client_transport, write_http_response, RelayStream,
 };
 use crate::{CORE_VERSION, VERSION};
 use std::collections::HashMap;
@@ -96,7 +96,7 @@ fn run(args: Args) -> io::Result<()> {
             password: args.password.clone(),
             target: args.target.clone(),
         };
-        start_local_server(args.server.clone(), local);
+        start_local_server(args.server.clone(), local, args.conn_type.clone());
         park_forever();
         return Ok(());
     }
@@ -108,7 +108,7 @@ fn run(args: Args) -> io::Result<()> {
             args.config.clone()
         };
         if Path::new(&path).exists() {
-            let config = match load_client_config(&path) {
+            let mut config = match load_client_config(&path) {
                 Ok(config) => config,
                 Err(err) => {
                     crate::log_error!("npc", "Config file {} loading error {}", path, err);
@@ -121,10 +121,15 @@ fn run(args: Args) -> io::Result<()> {
                 "the version of client is {VERSION}, the core version of client is {CORE_VERSION},tls enable is {}",
                 config.common.tls_enable
             );
+            apply_bridge_conn_type(&mut config);
             send_config(&config)?;
             start_health_monitor(config.clone());
             for local in config.local_servers.clone() {
-                start_local_server(config.common.server_addr.clone(), local);
+                start_local_server(
+                    config.common.server_addr.clone(),
+                    local,
+                    config.common.conn_type.clone(),
+                );
             }
             control_loop_with_reconnect(config)?;
             return Ok(());
@@ -148,6 +153,7 @@ fn run(args: Args) -> io::Result<()> {
     };
     config.common.tls_enable = args.tls_enable;
     config.common.client.verify_key = args.vkey;
+    apply_bridge_conn_type(&mut config);
     crate::log_info!(
         "npc",
         "the version of client is {VERSION}, the core version of client is {CORE_VERSION},tls enable is {}",
@@ -163,6 +169,7 @@ fn start_health_monitor(config: ClientRuntimeConfig) {
     }
 
     let server_addr = config.common.server_addr.clone();
+    let conn_type = config.common.conn_type.clone();
     let vkey = config.common.vkey.clone();
     let healths = config.healths.clone();
     crate::log_info!("npc", "health monitor enabled, rules={}", healths.len());
@@ -189,7 +196,13 @@ fn start_health_monitor(config: ClientRuntimeConfig) {
                         let failures = per_health.entry(target.clone()).or_insert(0);
                         if ok {
                             if *failures >= health.max_failed {
-                                if let Err(err) = report_health_change(&server_addr, &vkey, target, true) {
+                                if let Err(err) = report_health_change(
+                                    &server_addr,
+                                    &conn_type,
+                                    &vkey,
+                                    target,
+                                    true,
+                                ) {
                                     crate::log_trace!(
                                         "npc",
                                         "health restore report failed vkey={} target={} err={}",
@@ -204,7 +217,13 @@ fn start_health_monitor(config: ClientRuntimeConfig) {
                         } else {
                             *failures = failures.saturating_add(1);
                             if *failures % health.max_failed == 0 {
-                                if let Err(err) = report_health_change(&server_addr, &vkey, target, false) {
+                                if let Err(err) = report_health_change(
+                                    &server_addr,
+                                    &conn_type,
+                                    &vkey,
+                                    target,
+                                    false,
+                                ) {
                                     crate::log_trace!(
                                         "npc",
                                         "health remove report failed vkey={} target={} err={}",
@@ -232,11 +251,12 @@ fn start_health_monitor(config: ClientRuntimeConfig) {
 
 fn report_health_change(
     server_addr: &str,
+    conn_type: &str,
     vkey: &str,
     target: &str,
     status: bool,
 ) -> io::Result<()> {
-    let mut stream = TcpStream::connect(server_addr)?;
+    let mut stream = connect_bridge_stream(server_addr, BridgeMode::from_text(conn_type))?;
     let hello = BridgeHello::Health {
         vkey: vkey.to_string(),
         target: target.to_string(),
@@ -321,7 +341,10 @@ fn control_loop_with_reconnect(config: ClientRuntimeConfig) -> io::Result<()> {
 }
 
 fn send_config(config: &ClientRuntimeConfig) -> io::Result<()> {
-    let mut stream = TcpStream::connect(&config.common.server_addr)?;
+    let mut stream = connect_bridge_stream(
+        &config.common.server_addr,
+        BridgeMode::from_text(&config.common.conn_type),
+    )?;
     let hello = BridgeHello::Config {
         vkey: config.common.vkey.clone(),
         version: VERSION.to_string(),
@@ -383,7 +406,10 @@ fn log_config_mode_server_error(message: &str) {
 }
 
 fn control_loop(config: ClientRuntimeConfig) -> io::Result<()> {
-    let mut stream = TcpStream::connect(&config.common.server_addr)?;
+    let mut stream = connect_bridge_stream(
+        &config.common.server_addr,
+        BridgeMode::from_text(&config.common.conn_type),
+    )?;
     let mux_session = Arc::new(Mutex::new(None));
     let hello = BridgeHello::Control {
         vkey: config.common.vkey.clone(),
@@ -908,12 +934,16 @@ fn ensure_mux_session(
             return Ok(session);
         }
     }
-    let mut stream = TcpStream::connect(&config.common.server_addr)?;
+    let stream = connect_bridge_stream(
+        &config.common.server_addr,
+        BridgeMode::from_text(&config.common.conn_type),
+    )?;
     let hello = BridgeHello::Mux {
         vkey: config.common.vkey.clone(),
         version: VERSION.to_string(),
         core_version: CORE_VERSION.to_string(),
     };
+    let mut stream = stream;
     write_message(&mut stream, &hello)?;
     match read_message::<ServerMessage>(&mut stream)? {
         ServerMessage::Ok { .. } => {
@@ -954,7 +984,7 @@ fn open_mux_stream(
     }
 }
 
-fn start_local_server(server_addr: String, local: LocalServer) {
+fn start_local_server(server_addr: String, local: LocalServer, conn_type: String) {
     if local.port == 0 || local.password.is_empty() {
         crate::log_warn!(
             "npc",
@@ -989,8 +1019,9 @@ fn start_local_server(server_addr: String, local: LocalServer) {
             };
             let server_addr = server_addr.clone();
             let local = local.clone();
+            let conn_type = conn_type.clone();
             thread::spawn(move || {
-                if let Err(err) = connect_secret_visitor(server_addr, local, inbound) {
+                if let Err(err) = connect_secret_visitor(server_addr, conn_type, local, inbound) {
                     crate::log_warn!("npc", "local visitor failed: {err}");
                 }
             });
@@ -1000,10 +1031,11 @@ fn start_local_server(server_addr: String, local: LocalServer) {
 
 fn connect_secret_visitor(
     server_addr: String,
+    conn_type: String,
     local: LocalServer,
     inbound: TcpStream,
 ) -> io::Result<()> {
-    let mut bridge = TcpStream::connect(server_addr)?;
+    let mut bridge = connect_bridge_stream(&server_addr, BridgeMode::from_text(&conn_type))?;
     let hello = if local.kind.eq_ignore_ascii_case("p2p") {
         BridgeHello::P2pVisitor {
             password: local.password,
@@ -1027,7 +1059,7 @@ fn connect_secret_visitor(
 }
 
 fn register_ip(args: &Args) -> io::Result<()> {
-    let mut stream = TcpStream::connect(&args.server)?;
+    let mut stream = connect_bridge_stream(&args.server, BridgeMode::from_text(&args.conn_type))?;
     let hello = BridgeHello::RegisterIp {
         vkey: args.vkey.clone(),
         hours: args.register_hours,
@@ -1159,6 +1191,28 @@ fn parse_bool(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
 }
 
+fn normalized_bridge_conn_type(conn_type: &str) -> (String, bool) {
+    let normalized = conn_type.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "" | "tcp" => ("tcp".to_string(), false),
+        "kcp" => ("kcp".to_string(), false),
+        _ => ("tcp".to_string(), true),
+    }
+}
+
+fn apply_bridge_conn_type(config: &mut ClientRuntimeConfig) {
+    let original = config.common.conn_type.clone();
+    let (normalized, downgraded) = normalized_bridge_conn_type(&original);
+    if downgraded && !original.trim().is_empty() {
+        crate::log_warn!(
+            "npc",
+            "bridge type {} is not implemented in RustNps yet; falling back to tcp",
+            original
+        );
+    }
+    config.common.conn_type = normalized;
+}
+
 fn print_npc_help() {
     println!(
         r#"RustNps npc {VERSION} (core {CORE_VERSION})
@@ -1173,7 +1227,7 @@ Connection options:
   -server <ip:port>       Server bridge address, for example 127.0.0.1:8024
   -vkey <key>             Client verify key from the nps web panel
   -config <file>          Path to npc.conf. Default: conf/npc.conf
-  -type <tcp|kcp>         Bridge connection type. Current RustNps runtime supports tcp
+        -type <tcp|kcp>         Bridge connection type. kcp uses KCP transport
   -tls_enable=true        Enable TLS bridge connection flag in config/CLI metadata
     --console-log-level <info|debug>
                                                     Console log level. Default: info.
@@ -1203,7 +1257,10 @@ Examples:
 
 #[cfg(test)]
 mod tests {
-    use super::{report_health_change, write_proxy_protocol_v1, write_proxy_protocol_v2};
+    use super::{
+        normalized_bridge_conn_type, report_health_change, write_proxy_protocol_v1,
+        write_proxy_protocol_v2,
+    };
     use crate::protocol::{ok, read_message, write_message, BridgeHello};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -1277,8 +1334,22 @@ mod tests {
             }
         });
 
-        report_health_change(&addr.to_string(), "health-vkey", "127.0.0.1:8081", false).unwrap();
+        report_health_change(
+            &addr.to_string(),
+            "tcp",
+            "health-vkey",
+            "127.0.0.1:8081",
+            false,
+        )
+        .unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn kcp_bridge_type_is_preserved() {
+        let (normalized, downgraded) = normalized_bridge_conn_type("kcp");
+        assert_eq!(normalized, "kcp");
+        assert!(!downgraded);
     }
 }
 

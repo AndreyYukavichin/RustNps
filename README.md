@@ -18,56 +18,11 @@ RustNps 是对 Go 版 nps/npc 的 Rust 重构工程。当前工程保留 nps 的
 
 > Design note: this Rust edition focuses on a safe, explicit control-plane + data-plane split. The wire protocol is RustNps native (`RNP1`) and is intended for RustNps `rnps` and `rnpc` pairs, not for mixed Go/Rust runtime compatibility.
 
-## 功能覆盖
+## 主要能力
 
-当前 RustNps 已实现以下核心能力：
+RustNps 覆盖了 Go 版 nps / npc 的核心使用路径：服务端与客户端、常见隧道模式、HTTP / HTTPS / SOCKS5 / file / secret / p2p、Web 管理页、验证码登录、自动端口分配、环境变量渲染、压缩与加密包装、限速与流量封顶、IP 注册联动、以及 KCP bridge 支持。
 
-| Go nps 功能 | RustNps 模块 | 状态 |
-| --- | --- | --- |
-| 服务端 nps / 客户端 npc | `src/bin/nps.rs`, `src/bin/npc.rs` | 已实现 |
-| `nps.conf` / `npc.conf` 配置解析 | `src/config.rs` | 已实现，兼容常用字段 |
-| bridge 控制连接 | `src/protocol.rs`, `src/server.rs`, `src/client.rs` | 已实现 |
-| 客户端配置上报 | `BridgeHello::Config` | 已实现 |
-| TCP 隧道 | `start_tcp_listener` | 已实现 |
-| UDP 隧道 | `start_udp_listener` + `serve_udp` | 已实现，按请求短连接转发 |
-| HTTP 正向代理 | `start_http_proxy_listener` | 已实现，支持 CONNECT |
-| 域名代理 / URL location 路由 | `start_http_host_listener` | 已实现 HTTP |
-| HTTPS 域名代理 / SNI 多证书 | `src/tls.rs`, `start_https_host_listener` | 已实现 |
-| SOCKS5 代理 | `src/socks5.rs` | 已实现 no-auth CONNECT |
-| file 模式 | `serve_file` | 已实现客户端本地文件读取 |
-| secret 模式 | `SecretVisitor` relay | 已实现 |
-| p2p 模式 | `P2pVisitor` relay fallback | 已实现中继兜底 |
-| Web 管理页 | `start_web_manager` | 已实现轻量 Dashboard/API |
-| 管理面板登录验证码 | `open_captcha`, `/captcha/`, `login_captcha_block` | 已实现，开启后登录需验证验证码 |
-| Go 版 Web 静态资源 | `web/static` | 已迁移 Bootstrap、FontAwesome、ECharts、语言包、图片等 |
-| Go 版 Web 操作体验 | `src/server.rs` Web 兼容层 | 已实现登录、侧栏、Dashboard、客户端/隧道/域名列表和主要操作按钮 |
-| 新增/复制/编辑隧道自动分配端口 | `ensure_tunnel_server_port`, `generate_server_port` | 已实现，端口为空或 0 时自动回填可用端口 |
-| 端口范围映射 | `expand_ports`, `expand_runtime_tunnels` | 已实现 |
-| 环境变量渲染 | `{{.ENV_NAME}}` | 已实现 |
-| bridge mux 连接复用 | `src/mux.rs`, `src/client.rs`, `src/server.rs` | 已实现 |
-| `compress` / `crypt` 数据面包装 | `src/relay.rs`, `src/tls.rs` | 已实现，支持 snappy / TLS relay |
-| `allow_rate_limit` / `allow_flow_limit` | `src/relay.rs`, `src/server.rs` | 已实现运行时限速和流量封顶 |
-| `ip_limit` 注册与登录联动 | `src/server.rs`, `src/web.rs` | 已实现 |
-| `max_conn` / `max_tunnel_num` / `allow_ports` | `src/server.rs` | 已实现 |
-
-### 当前对齐说明
-
-下面这些 Go 版 nps 的近期能力，RustNps 目前已经补齐或保持兼容：
-
-- 管理面板登录验证码：配置 `open_captcha=true` 后，登录页会显示验证码并在登录时校验。
-- 隧道自动生成服务端口：新增、复制、编辑隧道时，如果端口为空或 0，会自动生成一个可用端口并写回任务。
-- API 返回 ID：新增客户端、主机、隧道时会返回对应的 `id`，方便前端或脚本继续操作。
-- 唯一验证密钥显示：域名解析页和隧道列表页已保留 `VerifyKey` / `VKey` 的展示与查询。
-- 客户端黑名单 IP：新增或编辑客户端时可配置多个黑名单 IP。
-- `ip_limit` 注册与登录联动：已保留注册授权 IP 逻辑，管理面板登录也会授权当前 IP。
-
-这部分功能已经可以按 Go 版的常见使用方式继续迁移；如果你在 Go 版里主要依赖的是上面这些能力，RustNps 现在已经覆盖了大部分日常管理路径。
-
-暂未完全等价 Go 版的高级实现：
-
-- KCP 与 Go 版 `nps_mux` wire compatibility。
-- Go Web UI 的深度持久化能力仍在演进；当前 Web 端已提供 Go 风格页面和内存态增删改查兼容层。
-- 真正 UDP NAT hole punching 的 P2P；当前 p2p 使用服务端中继 fallback，优先保证可用性。
+这里优先描述用户能直接使用的能力和启动方式；实现进展、功能对标和后续 TODO 请看 [docs/feature_map.md](docs/feature_map.md) 与 [docs/refactor_todos.md](docs/refactor_todos.md)。
 
 ## 快速开始
 
@@ -114,7 +69,30 @@ cargo build --release --target x86_64-pc-windows-msvc
 cargo build --release --target x86_64-unknown-linux-gnu
 ```
 
-### 3. 启动服务端
+### 3. 使用 Docker 镜像
+
+RustNps 也可以直接打包成多架构镜像并推送到 Docker Hub。仓库内提供了对应的 `Dockerfile` 和 GitHub Actions 发布流程，镜像名为 `andreiyhub/rustnps`。
+
+本地运行服务端示例：
+
+```bash
+docker run --rm \
+  -p 8081:8081 -p 8024:8024 -p 80:80 -p 443:443 \
+  -v "$PWD/conf:/etc/rustnps" \
+  andreiyhub/rustnps:latest
+```
+
+启动客户端示例：
+
+```bash
+docker run --rm \
+  -v "$PWD/conf:/etc/rustnps" \
+  andreiyhub/rustnps:latest rnpc -config=/etc/rustnps/npc.conf
+```
+
+如果需要指定架构，可以在 `docker run` 前加 `--platform`，例如 `linux/amd64`、`linux/arm64`、`linux/arm/v7` 或 `linux/386`。
+
+### 4. 启动服务端
 
 可直接复用 Go 版 `conf/nps.conf` 的常用字段：
 
@@ -157,7 +135,7 @@ Bootstrap Table 数据接口保持 Go 版习惯，返回 `rows` 和 `total`：
 - `POST /index/gettunnel`
 - `POST /index/hostlist`
 
-### 4. 启动客户端
+### 5. 启动客户端
 
 配置文件模式：
 
@@ -334,7 +312,7 @@ cargo build --release
 
 ```ini
 http_proxy_port=18080
-web_port=18081
+web_port=8081
 bridge_port=18024
 ```
 

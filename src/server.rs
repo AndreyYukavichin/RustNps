@@ -1,3 +1,4 @@
+use crate::bridge_transport::{BridgeListener, BridgeMode};
 use crate::config::{expand_ports, expand_targets, load_server_config};
 use crate::model::{
     ClientRuntimeConfig, CommonConfig, FlowCounter, GlobalConfig, Host, ServerConfig, Target,
@@ -397,6 +398,8 @@ fn install_persistent_state(registry: &Arc<Registry>, state: PersistentState) {
         start_tunnel_task(Arc::clone(registry), tunnel);
     }
 
+    refresh_host_runtime_registry(registry);
+
     crate::log_info!(
         "nps",
         "Persistent state loaded from {}",
@@ -459,7 +462,7 @@ pub fn run_with_store(config: ServerConfig, store: PersistentStore) -> io::Resul
     }
 
     let bridge_addr = format!("{}:{}", config.bridge_ip, config.bridge_port);
-    let listener = TcpListener::bind(&bridge_addr)?;
+    let mut listener = BridgeListener::bind(&bridge_addr, BridgeMode::from_text(&config.bridge_type))?;
     crate::log_info!(
         "nps",
         "server start, the bridge type is {}, the bridge port is {}",
@@ -468,12 +471,12 @@ pub fn run_with_store(config: ServerConfig, store: PersistentStore) -> io::Resul
     );
     crate::log_debug!("nps", "server bridge listening on {bridge_addr}");
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    loop {
+        match listener.accept() {
+            Ok((stream, peer_addr)) => {
                 let registry = Arc::clone(&registry);
                 thread::spawn(move || {
-                    if let Err(err) = handle_bridge_conn(stream, registry) {
+                    if let Err(err) = handle_bridge_conn(stream, peer_addr.to_string(), registry) {
                         crate::log_warn!("nps", "bridge connection error: {err}");
                     }
                 });
@@ -481,14 +484,12 @@ pub fn run_with_store(config: ServerConfig, store: PersistentStore) -> io::Resul
             Err(err) => crate::log_warn!("nps", "bridge accept error: {err}"),
         }
     }
-    Ok(())
 }
 
-fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Result<()> {
-    let remote_addr = stream
-        .peer_addr()
-        .map(|addr| addr.to_string())
-        .unwrap_or_default();
+fn handle_bridge_conn<S>(mut stream: S, remote_addr: String, registry: Arc<Registry>) -> io::Result<()>
+where
+    S: RelayStream + IntoIoHalves + Send + 'static,
+{
     let hello: BridgeHello = read_message(&mut stream)?;
     match hello {
         BridgeHello::Control {
@@ -690,7 +691,7 @@ fn handle_bridge_conn(mut stream: TcpStream, registry: Arc<Registry>) -> io::Res
         }
         BridgeHello::SecretVisitor { password, target }
         | BridgeHello::P2pVisitor { password, target } => {
-            handle_secret_visitor(stream, registry, &password, &target)?;
+            handle_secret_visitor(stream, registry, &password, &target, &remote_addr)?;
         }
         BridgeHello::RegisterIp { vkey, hours } => {
             ensure_ip_registration_vkey(&registry, &vkey)?;
@@ -983,6 +984,25 @@ fn stop_tunnel_runtimes(registry: &Arc<Registry>, tunnels: &[Tunnel]) {
     }
 }
 
+fn apply_tunnel_runtime_change(
+    registry: &Arc<Registry>,
+    previous: Option<&Tunnel>,
+    current: Option<Tunnel>,
+) {
+    if let Some(previous) = previous {
+        stop_tunnel_runtime(registry, previous);
+    }
+    if let Some(current) = current {
+        if current.status {
+            start_tunnel_task(Arc::clone(registry), current);
+        }
+    }
+}
+
+fn refresh_tunnel_runtime_registry(registry: &Arc<Registry>) {
+    rebuild_secret_registry(registry);
+}
+
 fn register_tunnel_live_conn(
     registry: &Arc<Registry>,
     tunnel_id: u64,
@@ -1078,6 +1098,26 @@ fn rebuild_secret_registry(registry: &Arc<Registry>) {
         }
     }
     *registry.secrets.lock().unwrap() = next;
+}
+
+fn host_mutation_result<R>(
+    registry: &Arc<Registry>,
+    id: u64,
+    mut apply: impl FnMut(&mut ClientRuntimeConfig, usize) -> Option<R>,
+) -> Option<R> {
+    let mut clients = registry.clients.lock().unwrap();
+    for config in clients.values_mut() {
+        if let Some(index) = config.hosts.iter().position(|host| host.id == id) {
+            return apply(config, index);
+        }
+    }
+    None
+}
+
+fn refresh_host_runtime_registry(registry: &Arc<Registry>) {
+    if let Err(err) = build_tls_config_for_registry(registry) {
+        crate::log_warn!("web", "host runtime refresh failed: {}", err);
+    }
 }
 
 fn listener_key(tunnel: &Tunnel) -> Option<String> {
@@ -1712,7 +1752,7 @@ fn handle_https_host_conn(inbound: TcpStream, registry: Arc<Registry>) -> io::Re
             crypt,
             compress,
             local_proxy: route.target.local_proxy,
-            proto_version: String::new(),
+            proto_version: route.proto_version.clone(),
             file: None,
         };
         let client_stream = request_client_stream(&registry, &route.client_vkey, link)?;
@@ -1790,12 +1830,16 @@ fn handle_https_host_conn(inbound: TcpStream, registry: Arc<Registry>) -> io::Re
     Ok(())
 }
 
-fn handle_secret_visitor(
-    mut visitor: TcpStream,
+fn handle_secret_visitor<S>(
+    mut visitor: S,
     registry: Arc<Registry>,
     password: &str,
     visitor_target: &str,
-) -> io::Result<()> {
+    remote_addr: &str,
+) -> io::Result<()>
+where
+    S: RelayStream + IntoIoHalves + Send + 'static,
+{
     let tunnel = {
         let secrets = registry.secrets.lock().unwrap();
         secrets
@@ -1822,10 +1866,7 @@ fn handle_secret_visitor(
             LinkKind::Secret
         },
         target,
-        remote_addr: visitor
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_default(),
+        remote_addr: remote_addr.to_string(),
         crypt,
         compress,
         local_proxy: tunnel.target.local_proxy,
@@ -2892,7 +2933,7 @@ fn proxy_host_request_tcp(
         crypt,
         compress,
         local_proxy: route.target.local_proxy,
-        proto_version: String::new(),
+        proto_version: route.proto_version.clone(),
         file: None,
     };
     let mut client_stream = match request_client_stream(registry, &route.client_vkey, link) {
@@ -2990,7 +3031,7 @@ where
         crypt,
         compress,
         local_proxy: route.target.local_proxy,
-        proto_version: String::new(),
+        proto_version: route.proto_version.clone(),
         file: None,
     };
     let mut client_stream = match request_client_stream(registry, &route.client_vkey, link) {
@@ -3281,6 +3322,23 @@ pub fn dashboard_json_scoped(registry: &Registry, scope_client_id: Option<u64>) 
             })
         })
         .collect();
+    let client_enabled_count = scoped_clients
+        .iter()
+        .filter(|client| client.common.client.status)
+        .count();
+    let client_disabled_count = scoped_clients.len().saturating_sub(client_enabled_count);
+    let active_tunnel_count = scoped_clients
+        .iter()
+        .flat_map(|client| client.tunnels.iter())
+        .filter(|tunnel| tunnel.status && tunnel.run_status)
+        .count();
+    let inactive_tunnel_count = tunnel_count.saturating_sub(active_tunnel_count);
+    let active_host_count = scoped_clients
+        .iter()
+        .flat_map(|client| client.hosts.iter())
+        .filter(|host| !host.is_close)
+        .count();
+    let inactive_host_count = host_count.saturating_sub(active_host_count);
     let (inlet_flow_count, export_flow_count) = scoped_clients.iter().fold((0_u64, 0_u64), |acc, client| {
         let flow = client_flow_snapshot(registry, &client.common.vkey);
         (
@@ -3326,8 +3384,14 @@ pub fn dashboard_json_scoped(registry: &Registry, scope_client_id: Option<u64>) 
         "clientCount": scoped_clients.len(),
         "clientOnlineCount": online_clients.len(),
         "onlineClients": online_clients,
+        "clientEnabledCount": client_enabled_count,
+        "clientDisabledCount": client_disabled_count,
         "hostCount": host_count,
+        "activeHostCount": active_host_count,
+        "inactiveHostCount": inactive_host_count,
         "tunnelCount": tunnel_count,
+        "activeTunnelCount": active_tunnel_count,
+        "inactiveTunnelCount": inactive_tunnel_count,
         "tcpC": tcp_count,
         "udpCount": udp_count,
         "socks5Count": socks_count,
@@ -3778,7 +3842,9 @@ fn client_health_summary(
         .collect();
     down_targets.sort();
 
-    let state = if config.healths.is_empty() {
+    let state = if !config.common.client.status {
+        "disabled"
+    } else if config.healths.is_empty() {
         "disabled"
     } else if down_targets.is_empty() {
         "healthy"
@@ -3794,6 +3860,16 @@ fn client_health_summary(
         "DownTargets": down_targets,
         "Rules": rules,
     })
+}
+
+pub fn client_health_down_targets(registry: &Registry, vkey: &str) -> HashSet<String> {
+    registry
+        .health_targets
+        .lock()
+        .unwrap()
+        .get(vkey)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn update_client_last_online_addr(registry: &Arc<Registry>, vkey: &str, addr: &str) {
@@ -3884,6 +3960,7 @@ pub fn host_rows(registry: &Arc<Registry>) -> Vec<serde_json::Value> {
                 "Location": host.location,
                 "HeaderChange": host.header_change,
                 "HostChange": host.host_change,
+                "ProtoVersion": host.proto_version,
                 "IsClose": host.is_close,
                 "CertFilePath": host.cert_file_path,
                 "KeyFilePath": host.key_file_path,
@@ -3948,8 +4025,10 @@ pub fn mutate_client_status(registry: &Arc<Registry>, params: &HashMap<String, S
             start_active_tunnels_for_client(registry, &current);
         } else {
             terminate_client_connection(registry, &vkey, "client disabled");
+            clear_client_health_runtime_state(registry, &vkey);
         }
         rebuild_secret_registry(registry);
+        refresh_host_runtime_registry(registry);
         persist_ajax(registry, "modified success")
     } else {
         ajax(0, "modified fail")
@@ -3970,7 +4049,9 @@ pub fn mutate_client_delete(registry: &Arc<Registry>, params: &HashMap<String, S
         crate::log_info!("web", "client delete mutation id={} vkey={}", removed.id, vkey);
         stop_tunnel_runtimes(registry, &removed.tunnels);
         terminate_client_connection(registry, &vkey, "client deleted");
+        clear_client_runtime_state(registry, &vkey);
         rebuild_secret_registry(registry);
+        refresh_host_runtime_registry(registry);
         persist_ajax(registry, "delete success")
     } else {
         ajax(0, "delete error")
@@ -4068,6 +4149,12 @@ pub fn mutate_client_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
         for host in &mut config.hosts {
             host.client_vkey = new_vkey.clone();
         }
+        rekey_client_runtime_state(
+            registry,
+            &vkey,
+            &new_vkey,
+            config.common.client.status,
+        );
         let current = config.clone();
         clients.insert(new_vkey, config);
         Some((vkey, previous, current))
@@ -4095,11 +4182,78 @@ pub fn mutate_client_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
                 start_active_tunnels_for_client(registry, &current);
             }
         }
+        sync_client_health_runtime_state(registry, &current.common.vkey, &current.healths);
         rebuild_secret_registry(registry);
+        refresh_host_runtime_registry(registry);
         persist_ajax(registry, "save success")
     } else {
         ajax(0, "client ID not found")
     }
+}
+
+fn rekey_client_runtime_state(
+    registry: &Arc<Registry>,
+    old_vkey: &str,
+    new_vkey: &str,
+    keep_health_state: bool,
+) {
+    if old_vkey == new_vkey {
+        return;
+    }
+
+    if keep_health_state {
+        let mut health_targets = registry.health_targets.lock().unwrap();
+        if let Some(targets) = health_targets.remove(old_vkey) {
+            health_targets
+                .entry(new_vkey.to_string())
+                .or_insert_with(HashSet::new)
+                .extend(targets);
+        }
+    } else {
+        registry.health_targets.lock().unwrap().remove(old_vkey);
+    }
+
+    let mut flow_counters = registry.client_flow_counters.lock().unwrap();
+    if let Some(counter) = flow_counters.remove(old_vkey) {
+        flow_counters.insert(new_vkey.to_string(), counter);
+    }
+}
+
+fn sync_client_health_runtime_state(
+    registry: &Arc<Registry>,
+    vkey: &str,
+    healths: &[crate::model::HealthCheck],
+) {
+    let mut health_targets = registry.health_targets.lock().unwrap();
+    let Some(targets) = health_targets.get_mut(vkey) else {
+        return;
+    };
+
+    let mut allowed_targets = HashSet::new();
+    for health in healths {
+        for target in &health.targets {
+            allowed_targets.insert(target.clone());
+        }
+    }
+
+    if allowed_targets.is_empty() {
+        health_targets.remove(vkey);
+        return;
+    }
+
+    targets.retain(|target| allowed_targets.contains(target));
+    if targets.is_empty() {
+        health_targets.remove(vkey);
+    }
+}
+
+fn clear_client_health_runtime_state(registry: &Arc<Registry>, vkey: &str) {
+    registry.health_targets.lock().unwrap().remove(vkey);
+}
+
+fn clear_client_runtime_state(registry: &Arc<Registry>, vkey: &str) {
+    registry.health_targets.lock().unwrap().remove(vkey);
+    registry.client_flow_counters.lock().unwrap().remove(vkey);
 }
 
 fn apply_client_form(info: &mut crate::model::ClientInfo, params: &HashMap<String, String>) {
@@ -4162,11 +4316,12 @@ pub fn mutate_tunnel_status(
             current.client_vkey,
             status
         );
-        stop_tunnel_runtime(registry, &previous);
-        if status {
-            start_tunnel_task(Arc::clone(registry), current);
-        }
-        rebuild_secret_registry(registry);
+        apply_tunnel_runtime_change(
+            registry,
+            Some(&previous),
+            if status { Some(current) } else { None },
+        );
+        refresh_tunnel_runtime_registry(registry);
         persist_ajax(
             registry,
             if status {
@@ -4201,8 +4356,8 @@ pub fn mutate_tunnel_delete(registry: &Arc<Registry>, params: &HashMap<String, S
             tunnel.client_vkey,
             tunnel.remark
         );
-        stop_tunnel_runtime(registry, &tunnel);
-        rebuild_secret_registry(registry);
+        apply_tunnel_runtime_change(registry, Some(&tunnel), None);
+        refresh_tunnel_runtime_registry(registry);
         persist_ajax(registry, "delete success")
     } else {
         ajax(0, "delete error")
@@ -4247,9 +4402,8 @@ pub fn mutate_tunnel_copy(registry: &Arc<Registry>, params: &HashMap<String, Str
             tunnel.client_vkey,
             tunnel.remark
         );
-        if tunnel.server_port > 0 {
-            start_tunnel_task(Arc::clone(registry), tunnel);
-        }
+        apply_tunnel_runtime_change(registry, None, Some(tunnel));
+        refresh_tunnel_runtime_registry(registry);
         persist_ajax(registry, "add success")
     } else {
         ajax(0, "copy error")
@@ -4316,8 +4470,8 @@ pub fn mutate_tunnel_add(registry: &Arc<Registry>, params: &HashMap<String, Stri
             tunnel.server_port,
             tunnel.remark
         );
-        start_tunnel_task(Arc::clone(registry), tunnel.clone());
-        rebuild_secret_registry(registry);
+        apply_tunnel_runtime_change(registry, None, Some(tunnel.clone()));
+        refresh_tunnel_runtime_registry(registry);
         match persist_registry(registry) {
             Ok(()) => ajax_with_id(1, "add success", tunnel.id),
             Err(err) => ajax(0, &format!("added but save failed: {err}")),
@@ -4379,11 +4533,8 @@ pub fn mutate_tunnel_edit(registry: &Arc<Registry>, params: &HashMap<String, Str
             current.server_port,
             current.remark
         );
-        stop_tunnel_runtime(registry, &previous);
-        if current.status {
-            start_tunnel_task(Arc::clone(registry), current);
-        }
-        rebuild_secret_registry(registry);
+        apply_tunnel_runtime_change(registry, Some(&previous), Some(current));
+        refresh_tunnel_runtime_registry(registry);
         persist_ajax(registry, "modified success")
     } else {
         ajax(0, "modified error")
@@ -4396,20 +4547,22 @@ pub fn mutate_host_status(
     is_close: bool,
 ) -> String {
     let id = param(params, "id").parse::<u64>().unwrap_or(0);
-    let modified = {
-        let mut clients = registry.clients.lock().unwrap();
-        let mut found = false;
-        for config in clients.values_mut() {
-            if let Some(host) = config.hosts.iter_mut().find(|h| h.id == id) {
-                host.is_close = is_close;
-                found = true;
-                break;
-            }
-        }
-        found
-    };
-    if modified {
-        crate::log_info!("web", "host status mutation id={} is_close={}", id, is_close);
+    let modified = host_mutation_result(registry, id, |config, index| {
+        let previous = config.hosts[index].clone();
+        config.hosts[index].is_close = is_close;
+        Some((previous, config.hosts[index].clone()))
+    });
+    if let Some((_, current)) = modified {
+        crate::log_info!(
+            "web",
+            "host status mutation id={} client_vkey={} host={} location={} is_close={}",
+            current.id,
+            current.client_vkey,
+            current.host,
+            current.location,
+            is_close
+        );
+        refresh_host_runtime_registry(registry);
         persist_ajax(
             registry,
             if is_close {
@@ -4432,21 +4585,17 @@ pub fn mutate_host_status(
 
 pub fn mutate_host_delete(registry: &Arc<Registry>, params: &HashMap<String, String>) -> String {
     let id = param(params, "id").parse::<u64>().unwrap_or(0);
-    let deleted = {
-        let mut clients = registry.clients.lock().unwrap();
-        let mut removed = false;
-        for config in clients.values_mut() {
-            let before = config.hosts.len();
-            config.hosts.retain(|h| h.id != id);
-            if config.hosts.len() != before {
-                removed = true;
-                break;
-            }
-        }
-        removed
-    };
-    if deleted {
-        crate::log_info!("web", "host delete mutation id={}", id);
+    let deleted = host_mutation_result(registry, id, |config, index| Some(config.hosts.remove(index)));
+    if let Some(removed) = deleted {
+        crate::log_info!(
+            "web",
+            "host delete mutation id={} client_vkey={} host={} location={}",
+            removed.id,
+            removed.client_vkey,
+            removed.host,
+            removed.location
+        );
+        refresh_host_runtime_registry(registry);
         persist_ajax(registry, "delete success")
     } else {
         ajax(0, "delete error")
@@ -4491,12 +4640,14 @@ pub fn mutate_host_add(registry: &Arc<Registry>, params: &HashMap<String, String
     if added {
         crate::log_info!(
             "web",
-            "host add mutation id={} client_id={} host={} location={}",
+            "host add mutation id={} client_id={} client_vkey={} host={} location={}",
             added_id,
             client_id,
+            host.client_vkey,
             host.host,
             host.location
         );
+        refresh_host_runtime_registry(registry);
         match persist_registry(registry) {
             Ok(()) => ajax_with_id(1, "add success", added_id),
             Err(err) => ajax(0, &format!("added but save failed: {err}")),
@@ -4508,28 +4659,29 @@ pub fn mutate_host_add(registry: &Arc<Registry>, params: &HashMap<String, String
 
 pub fn mutate_host_edit(registry: &Arc<Registry>, params: &HashMap<String, String>) -> String {
     let id = param(params, "id").parse::<u64>().unwrap_or(0);
-    let modified = {
-        let mut clients = registry.clients.lock().unwrap();
-        let mut found = false;
-        for config in clients.values_mut() {
-            if let Some(index) = config.hosts.iter().position(|h| h.id == id) {
-                let mut updated = config.hosts[index].clone();
-                fill_host_from_params(&mut updated, params);
-                updated.no_store = false;
-                if config.hosts.iter().any(|item| {
-                    item.id != id && item.host == updated.host && item.location == updated.location
-                }) {
-                    return ajax(0, "host has exist");
-                }
-                config.hosts[index] = updated;
-                found = true;
-                break;
-            }
+    let modified = host_mutation_result(registry, id, |config, index| {
+        let previous = config.hosts[index].clone();
+        let mut updated = previous.clone();
+        fill_host_from_params(&mut updated, params);
+        updated.no_store = false;
+        if config.hosts.iter().any(|item| {
+            item.id != id && item.host == updated.host && item.location == updated.location
+        }) {
+            return None;
         }
-        found
-    };
-    if modified {
-        crate::log_info!("web", "host edit mutation id={}", id);
+        config.hosts[index] = updated.clone();
+        Some((previous, updated))
+    });
+    if let Some((_, current)) = modified {
+        crate::log_info!(
+            "web",
+            "host edit mutation id={} client_vkey={} host={} location={}",
+            current.id,
+            current.client_vkey,
+            current.host,
+            current.location
+        );
+        refresh_host_runtime_registry(registry);
         persist_ajax(registry, "modified success")
     } else {
         ajax(0, "modified error")
@@ -4560,6 +4712,7 @@ fn fill_host_from_params(host: &mut Host, params: &HashMap<String, String>) {
     host.remark = param(params, "remark");
     host.cert_file_path = param_any(params, &["cert_file_path", "certFilePath"]);
     host.key_file_path = param_any(params, &["key_file_path", "keyFilePath"]);
+    host.proto_version = param_any(params, &["proto_version", "proxy_protocol"]);
     host.auto_https = param_bool_any(params, &["auto_https", "AutoHttps"]);
     host.location = {
         let location = param(params, "location");
@@ -4685,6 +4838,7 @@ mod tests {
             ("scheme".to_string(), "https".to_string()),
             ("cert_file_path".to_string(), "CERT".to_string()),
             ("key_file_path".to_string(), "KEY".to_string()),
+            ("proto_version".to_string(), "V1".to_string()),
         ]);
         assert!(mutate_host_add(&registry, &add).contains("add success"));
 
@@ -4693,6 +4847,7 @@ mod tests {
         assert_eq!(state.hosts[0].host, "example.com");
         assert_eq!(state.hosts[0].scheme, "https");
         assert_eq!(state.hosts[0].cert_file_path, "CERT");
+        assert_eq!(state.hosts[0].proto_version, "V1");
 
         let host_id = state.hosts[0].id;
         let edit = HashMap::from([
@@ -4703,6 +4858,7 @@ mod tests {
             ("scheme".to_string(), "all".to_string()),
             ("cert_file_path".to_string(), "CERT2".to_string()),
             ("key_file_path".to_string(), "KEY2".to_string()),
+            ("proto_version".to_string(), "V2".to_string()),
         ]);
         assert!(mutate_host_edit(&registry, &edit).contains("modified success"));
 
@@ -4711,6 +4867,7 @@ mod tests {
         assert_eq!(state.hosts[0].location, "/v2");
         assert_eq!(state.hosts[0].target.target_str, "127.0.0.1:9090");
         assert_eq!(state.hosts[0].cert_file_path, "CERT2");
+        assert_eq!(state.hosts[0].proto_version, "V2");
 
         let delete = HashMap::from([("id".to_string(), host_id.to_string())]);
         assert!(mutate_host_delete(&registry, &delete).contains("delete success"));
@@ -4721,7 +4878,103 @@ mod tests {
     }
 
     #[test]
-    fn host_status_and_delete_take_effect_in_runtime_route_lookup() {
+    fn host_proxy_protocol_reaches_backend() {
+        let root = temp_test_dir("rustnps-host-proxy-proto");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 112, "host-proto", false);
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend = thread::spawn(move || {
+            let (mut socket, _) = backend_listener.accept().unwrap();
+            let head = read_http_head(&mut socket, 16 * 1024).unwrap();
+            assert!(String::from_utf8(head).unwrap().contains("GET / HTTP/1.1"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok",
+                )
+                .unwrap();
+            socket.flush().unwrap();
+        });
+
+        let route = Host {
+            host: "example.com".to_string(),
+            scheme: "http".to_string(),
+            proto_version: "V1".to_string(),
+            client_vkey: "host-proto".to_string(),
+            target: Target {
+                target_str: backend_addr.to_string(),
+                local_proxy: false,
+            },
+            ..Host::default()
+        };
+        {
+            let mut clients = registry.clients.lock().unwrap();
+            let client = clients.get_mut("host-proto").unwrap();
+            client.hosts.push(route.clone());
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        registry.controls.lock().unwrap().insert(
+            "host-proto".to_string(),
+            ControlHandle {
+                tx,
+                version: VERSION.to_string(),
+                connected_at: SystemTime::now(),
+                remote_addr: "127.0.0.1:0".to_string(),
+            },
+        );
+
+        let registry_for_pending = Arc::clone(&registry);
+        let data_thread = thread::spawn(move || {
+            let ServerMessage::Open { link_id, link } = rx.recv().unwrap() else {
+                panic!("expected open message");
+            };
+            assert_eq!(link.proto_version, "V1");
+            let pair_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let pair_addr = pair_listener.local_addr().unwrap();
+            let client_side = TcpStream::connect(pair_addr).unwrap();
+            let (server_side, _) = pair_listener.accept().unwrap();
+            let pending = registry_for_pending.pending.lock().unwrap().remove(&link_id);
+            let tx = pending.expect("pending sender");
+            tx.send(Box::new(server_side)).unwrap();
+            handle_single_request_backend(Box::new(client_side), backend_addr.to_string()).unwrap();
+        });
+
+        let registry_for_handler = Arc::clone(&registry);
+        let route_for_handler = route.clone();
+        let target_for_handler = backend_addr.to_string();
+        let response = replay_http_owned(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n", move |mut socket| {
+            let head = read_http_head(&mut socket, 16 * 1024)?;
+            let (prepared_head, cache_key) = prepare_host_proxy_request(
+                &registry_for_handler,
+                &route_for_handler,
+                "127.0.0.1:44444",
+                &head,
+                "http",
+            )
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, format!("prepare host proxy request failed: {:?}", err)))?;
+            proxy_host_request_tcp(
+                &registry_for_handler,
+                socket,
+                route_for_handler.clone(),
+                "127.0.0.1:44444".to_string(),
+                target_for_handler,
+                prepared_head,
+                cache_key,
+            )
+        });
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.contains("HTTP/1.1 200 OK"), "unexpected host proxy response: {text}");
+        assert!(text.contains("ok"), "unexpected host proxy response body: {text}");
+
+        let _ = data_thread.join();
+        let _ = backend.join();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn host_status_edit_and_delete_take_effect_in_runtime_route_lookup() {
         let root = temp_test_dir("rustnps-host-runtime");
         let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
         install_test_client(&registry, 111, "host-runtime", false);
@@ -4756,6 +5009,19 @@ mod tests {
         assert!(mutate_host_status(&registry, &start, false).contains("start success"));
         let route = find_host_route(&registry, "example.com", "/api/users", "http").unwrap();
         assert_eq!(route.0.id, host_id);
+
+        let edit = HashMap::from([
+            ("id".to_string(), host_id.to_string()),
+            ("host".to_string(), "example.com".to_string()),
+            ("target".to_string(), "127.0.0.1:9090".to_string()),
+            ("location".to_string(), "/v2".to_string()),
+            ("scheme".to_string(), "http".to_string()),
+        ]);
+        assert!(mutate_host_edit(&registry, &edit).contains("modified success"));
+        assert!(find_host_route(&registry, "example.com", "/api/users", "http").is_none());
+        let route = find_host_route(&registry, "example.com", "/v2/users", "http").unwrap();
+        assert_eq!(route.0.id, host_id);
+        assert_eq!(route.1, "127.0.0.1:9090");
 
         let delete = HashMap::from([("id".to_string(), host_id.to_string())]);
         assert!(mutate_host_delete(&registry, &delete).contains("delete success"));
@@ -4808,6 +5074,47 @@ mod tests {
     }
 
     #[test]
+    fn tunnel_status_toggle_restarts_listener() {
+        let root = temp_test_dir("rustnps-tunnel-status");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 205, "client-status", false);
+
+        let port = free_tcp_port();
+        let add = HashMap::from([
+            ("client_id".to_string(), "205".to_string()),
+            ("type".to_string(), "tcp".to_string()),
+            ("port".to_string(), port.to_string()),
+            ("target".to_string(), "127.0.0.1:22".to_string()),
+            ("remark".to_string(), "status-test".to_string()),
+        ]);
+        assert!(mutate_tunnel_add(&registry, &add).contains("add success"));
+        assert!(wait_until_port_accepting(port));
+
+        let tunnel_id = {
+            let clients = registry.clients.lock().unwrap();
+            clients
+                .get("client-status")
+                .and_then(|client| client.tunnels.first())
+                .map(|tunnel| tunnel.id)
+                .unwrap()
+        };
+
+        let stop = HashMap::from([("id".to_string(), tunnel_id.to_string())]);
+        assert!(mutate_tunnel_status(&registry, &stop, false).contains("stop success"));
+        assert!(wait_until_port_closed(port));
+
+        let start = HashMap::from([("id".to_string(), tunnel_id.to_string())]);
+        assert!(mutate_tunnel_status(&registry, &start, true).contains("start success"));
+        assert!(wait_until_port_accepting(port));
+
+        let delete = HashMap::from([("id".to_string(), tunnel_id.to_string())]);
+        assert!(mutate_tunnel_delete(&registry, &delete).contains("delete success"));
+        assert!(wait_until_port_closed(port));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn validate_client_handshake_rejects_unknown_vkey() {
         let root = temp_test_dir("rustnps-handshake-invalid");
         let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
@@ -4825,6 +5132,25 @@ mod tests {
         let root = temp_test_dir("rustnps-disable-client");
         let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
         install_test_client(&registry, 303, "client-c", false);
+
+        {
+            let mut clients = registry.clients.lock().unwrap();
+            let client = clients.get_mut("client-c").unwrap();
+            client.healths = vec![HealthCheck {
+                remark: "backend".to_string(),
+                kind: "tcp".to_string(),
+                interval_secs: 5,
+                timeout_secs: 1,
+                max_failed: 2,
+                http_url: String::new(),
+                targets: vec!["127.0.0.1:8081".to_string()],
+            }];
+        }
+        registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .insert("client-c".to_string(), ["127.0.0.1:8081".to_string()].into_iter().collect());
 
         let (tx, rx) = std::sync::mpsc::channel();
         registry.controls.lock().unwrap().insert(
@@ -4848,6 +5174,17 @@ mod tests {
             other => panic!("unexpected control message: {other:?}"),
         }
         assert!(!registry.controls.lock().unwrap().contains_key("client-c"));
+        assert!(!registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .contains_key("client-c"));
+
+        let row = client_rows(&registry)
+            .into_iter()
+            .find(|row| row["VerifyKey"] == "client-c")
+            .unwrap();
+        assert_eq!(row["Health"]["State"], "disabled");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4857,6 +5194,18 @@ mod tests {
         let root = temp_test_dir("rustnps-rotate-vkey");
         let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
         install_test_client(&registry, 304, "old-vkey", false);
+
+        registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .insert("old-vkey".to_string(), ["127.0.0.1:8081".to_string()].into_iter().collect());
+        {
+            let counter = client_flow_counter(&registry, "old-vkey");
+            let mut counter = counter.lock().unwrap();
+            counter.inlet_flow = 11;
+            counter.export_flow = 22;
+        }
 
         let (tx, rx) = std::sync::mpsc::channel();
         registry.controls.lock().unwrap().insert(
@@ -4889,10 +5238,112 @@ mod tests {
         assert!(!clients.contains_key("old-vkey"));
         drop(clients);
         assert!(!registry.controls.lock().unwrap().contains_key("old-vkey"));
+        assert!(registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .get("old-vkey")
+            .is_none());
+        assert_eq!(
+            registry
+                .health_targets
+                .lock()
+                .unwrap()
+                .get("new-vkey")
+                .cloned()
+                .unwrap_or_default(),
+            ["127.0.0.1:8081".to_string()].into_iter().collect()
+        );
+        let flow = client_flow_snapshot(&registry, "new-vkey");
+        assert_eq!(flow.inlet_flow, 11);
+        assert_eq!(flow.export_flow, 22);
         assert!(
             validate_client_handshake(&registry, "old-vkey", "127.0.0.1:1234", false).is_err()
         );
         validate_client_handshake(&registry, "new-vkey", "127.0.0.1:1234", false).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn editing_client_reconciles_stale_health_targets() {
+        let root = temp_test_dir("rustnps-health-reconcile");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 305, "health-reconcile", false);
+
+        {
+            let mut clients = registry.clients.lock().unwrap();
+            let client = clients.get_mut("health-reconcile").unwrap();
+            client.healths = vec![HealthCheck {
+                remark: "backend".to_string(),
+                kind: "tcp".to_string(),
+                interval_secs: 5,
+                timeout_secs: 1,
+                max_failed: 2,
+                http_url: String::new(),
+                targets: vec!["127.0.0.1:8081".to_string()],
+            }];
+        }
+        registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .insert(
+                "health-reconcile".to_string(),
+                ["127.0.0.1:8081".to_string(), "127.0.0.1:8082".to_string()]
+                    .into_iter()
+                    .collect(),
+            );
+
+        let edit = HashMap::from([
+            ("id".to_string(), "305".to_string()),
+            ("remark".to_string(), "health-reconcile-edited".to_string()),
+        ]);
+        assert!(mutate_client_edit(&registry, &edit).contains("save success"));
+
+        let targets = registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .get("health-reconcile")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(targets, ["127.0.0.1:8081".to_string()].into_iter().collect());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn deleting_client_clears_runtime_state() {
+        let root = temp_test_dir("rustnps-client-delete-runtime-state");
+        let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
+        install_test_client(&registry, 306, "delete-runtime", false);
+
+        registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .insert("delete-runtime".to_string(), ["127.0.0.1:8081".to_string()].into_iter().collect());
+        {
+            let counter = client_flow_counter(&registry, "delete-runtime");
+            let mut counter = counter.lock().unwrap();
+            counter.inlet_flow = 7;
+            counter.export_flow = 9;
+        }
+
+        let delete = HashMap::from([("id".to_string(), "306".to_string())]);
+        assert!(mutate_client_delete(&registry, &delete).contains("delete success"));
+
+        assert!(!registry
+            .health_targets
+            .lock()
+            .unwrap()
+            .contains_key("delete-runtime"));
+        assert!(!registry
+            .client_flow_counters
+            .lock()
+            .unwrap()
+            .contains_key("delete-runtime"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4983,10 +5434,43 @@ mod tests {
         let root = temp_test_dir("rustnps-health-ui");
         let registry = Arc::new(Registry::new(ServerConfig::default(), PersistentStore::new(&root)));
         install_test_client(&registry, 909, "health-ui", false);
+        install_test_client(&registry, 910, "disabled-ui", false);
 
         {
             let mut clients = registry.clients.lock().unwrap();
             let client = clients.get_mut("health-ui").unwrap();
+            client.tunnels = vec![
+                Tunnel {
+                    id: 1,
+                    mode: "tcp".to_string(),
+                    server_port: 10001,
+                    status: true,
+                    run_status: true,
+                    ..Tunnel::default()
+                },
+                Tunnel {
+                    id: 2,
+                    mode: "tcp".to_string(),
+                    server_port: 10002,
+                    status: false,
+                    run_status: false,
+                    ..Tunnel::default()
+                },
+            ];
+            client.hosts = vec![
+                Host {
+                    id: 1,
+                    host: "up.example.com".to_string(),
+                    is_close: false,
+                    ..Host::default()
+                },
+                Host {
+                    id: 2,
+                    host: "down.example.com".to_string(),
+                    is_close: true,
+                    ..Host::default()
+                },
+            ];
             client.healths = vec![HealthCheck {
                 remark: "backend".to_string(),
                 kind: "tcp".to_string(),
@@ -4996,6 +5480,7 @@ mod tests {
                 http_url: String::new(),
                 targets: vec!["127.0.0.1:8081".to_string(), "127.0.0.1:8082".to_string()],
             }];
+            clients.get_mut("disabled-ui").unwrap().common.client.status = false;
         }
         registry
             .health_targets
@@ -5019,6 +5504,12 @@ mod tests {
         assert_eq!(dashboard["healthRuleCount"], 1);
         assert_eq!(dashboard["healthTargetCount"], 2);
         assert_eq!(dashboard["healthDownCount"], 1);
+        assert_eq!(dashboard["clientEnabledCount"], 1);
+        assert_eq!(dashboard["clientDisabledCount"], 1);
+        assert_eq!(dashboard["activeTunnelCount"], 1);
+        assert_eq!(dashboard["inactiveTunnelCount"], 1);
+        assert_eq!(dashboard["activeHostCount"], 1);
+        assert_eq!(dashboard["inactiveHostCount"], 1);
         assert_eq!(dashboard["healthClients"].as_array().unwrap().len(), 1);
 
         let _ = fs::remove_dir_all(root);
@@ -5495,6 +5986,26 @@ mod tests {
 
         let mut client = TcpStream::connect(addr).unwrap();
         client.write_all(request).unwrap();
+        let response = read_replay_bytes(&mut client);
+        server.join().unwrap();
+        response
+    }
+
+    fn replay_http_owned<F>(request: &[u8], handler: F) -> Vec<u8>
+    where
+        F: FnOnce(TcpStream) -> io::Result<()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            handler(socket).unwrap();
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(request).unwrap();
+        client.flush().unwrap();
+        let _ = client.shutdown(std::net::Shutdown::Write);
         let response = read_replay_bytes(&mut client);
         server.join().unwrap();
         response

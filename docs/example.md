@@ -151,7 +151,7 @@ cargo run --bin rnps -- -conf_path conf/nps.conf
 cargo run --bin rnpc -- -config conf/npc.conf
 ```
 
-3. 打开 Web 管理页：`http://127.0.0.1:18081/`（默认端口可能不同，参照 `conf/nps.conf`）
+3. 打开 Web 管理页：http://127.0.0.1:8081/（默认端口可能不同，参照 `conf/nps.conf`）
 
 4. 在 Client List / Tunnel 页面检查已注册的隧道并发起连接测试。
 

@@ -55,19 +55,19 @@
 | `allow_rate_limit` / `allow_flow_limit` | 已实现 | [src/relay.rs](../src/relay.rs), [src/server.rs](../src/server.rs) |
 | `max_conn` / `max_tunnel_num` / `allow_ports` | 已实现 | [src/server.rs](../src/server.rs) |
 | HTTP Basic 认证 | 已实现 | [src/relay.rs](../src/relay.rs), [src/server.rs](../src/server.rs) |
-| Proxy Protocol | 部分实现 | [src/config.rs](../src/config.rs), [src/server.rs](../src/server.rs), [src/relay.rs](../src/relay.rs) |
+| Proxy Protocol | 已实现 | [src/config.rs](../src/config.rs), [src/server.rs](../src/server.rs), [src/relay.rs](../src/relay.rs), [src/client.rs](../src/client.rs) |
 
 ## 运行时与兼容性
 
 | 报告项 | 状态 | 代码位置 |
 | --- | --- | --- |
 | TCP / TLS bridge | 已实现 | [src/client.rs](../src/client.rs), [src/server.rs](../src/server.rs), [src/tls.rs](../src/tls.rs) |
-| KCP bridge | 未实现 | 仅有帮助文本占位，见 [src/client.rs](../src/client.rs) |
+| KCP bridge | 已实现 | [src/bridge_transport.rs](../src/bridge_transport.rs), [src/client.rs](../src/client.rs), [src/server.rs](../src/server.rs), [src/mux.rs](../src/mux.rs) |
 | 压缩 / 加密数据面包装 | 已实现 | [src/relay.rs](../src/relay.rs), [src/tls.rs](../src/tls.rs) |
 | 健康检查 | 部分实现 | [src/config.rs](../src/config.rs), [src/model.rs](../src/model.rs), [src/store.rs](../src/store.rs) |
 | 反向多路复用流关闭语义 | 已实现 | [src/relay.rs](../src/relay.rs), [src/mux.rs](../src/mux.rs) |
-| Go Web UI 深度持久化 | 部分实现 | [src/web.rs](../src/web.rs), [src/server.rs](../src/server.rs) |
+| Go Web UI 深度持久化 | 已实现 | [src/web.rs](../src/web.rs), [src/server.rs](../src/server.rs), [web/static/js/table-state.js](../web/static/js/table-state.js) |
 
 ## 结论
 
-RustNps 已经覆盖了绝大多数常用穿透场景。当前最值得继续推进的缺口是 KCP、Proxy Protocol、健康检查调度和更完整的任务热更新语义。详细 todo 请看 [refactor_todos.md](refactor_todos.md)。
+RustNps 已经覆盖了绝大多数常用穿透场景。当前最值得继续推进的缺口是健康检查调度、更完整的运维指标聚合，以及 p2p 的真实 NAT 打洞能力。详细 todo 请看 [refactor_todos.md](refactor_todos.md)。

@@ -7,6 +7,20 @@
     </div>
 
     <div class="row">
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5>Enabled Clients</h5></div><div class="ibox-content"><h1 id="client-enabled-count" class="no-margins"></h1></div></div></div>
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5>Disabled Clients</h5></div><div class="ibox-content"><h1 id="client-disabled-count" class="no-margins"></h1></div></div></div>
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5>Active Tunnels</h5></div><div class="ibox-content"><h1 id="tunnel-active-count" class="no-margins"></h1></div></div></div>
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5>Inactive Tunnels</h5></div><div class="ibox-content"><h1 id="tunnel-inactive-count" class="no-margins"></h1></div></div></div>
+    </div>
+
+    <div class="row">
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5>Active Hosts</h5></div><div class="ibox-content"><h1 id="host-active-count" class="no-margins"></h1></div></div></div>
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5>Inactive Hosts</h5></div><div class="ibox-content"><h1 id="host-inactive-count" class="no-margins"></h1></div></div></div>
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5>Health Clients</h5></div><div class="ibox-content"><h1 id="health-client-count" class="no-margins"></h1></div></div></div>
+        <div class="col-lg-3"><div class="ibox float-e-margins"><div class="ibox-title"><h5>Down Targets</h5></div><div class="ibox-content"><h1 id="health-down-count" class="no-margins"></h1></div></div></div>
+    </div>
+
+    <div class="row">
         <div class="col-lg-6">
             <div class="ibox float-e-margins">
                 <div class="ibox-title"><h5 langtag="word-configurationinformation"></h5><div class="ibox-tools"><a class="collapse-link"><i class="fa fa-chevron-up"></i></a><a class="close-link"><i class="fa fa-times"></i></a></div></div>
@@ -79,6 +93,16 @@ function refreshCommonOverview(data) {
     $("#overview_send").text(changeunit(data.io_send) + "/s");
     $("#overview_recv").text(changeunit(data.io_recv) + "/s");
 }
+function refreshAggregateOverview(data) {
+    $("#client-enabled-count").text(data.clientEnabledCount ?? 0);
+    $("#client-disabled-count").text(data.clientDisabledCount ?? 0);
+    $("#tunnel-active-count").text(data.activeTunnelCount ?? 0);
+    $("#tunnel-inactive-count").text(data.inactiveTunnelCount ?? 0);
+    $("#host-active-count").text(data.activeHostCount ?? 0);
+    $("#host-inactive-count").text(data.inactiveHostCount ?? 0);
+    $("#health-client-count").text(data.healthClientCount ?? 0);
+    $("#health-down-count").text(data.healthDownCount ?? 0);
+}
 $("#bridge-port").text(data.bridgeType + ":" + data.httpProxyPort);
 $("#client-count").text(data.clientCount);
 $("#online-count").text(data.clientOnlineCount);
@@ -103,6 +127,7 @@ conf_rows.forEach(function(row){
 });
 
 refreshCommonOverview(data);
+refreshAggregateOverview(data);
 
 const sys_data = [];
 for(let i=1; i<=10; i++) sys_data.push(data["sys"+i]);
@@ -185,6 +210,7 @@ function refreshDashboard() {
     $.getJSON(window.nps.web_base_url + '/api/dashboard', function(data) {
         try {
             refreshCommonOverview(data);
+            refreshAggregateOverview(data);
         } catch (e) {
             console.error('refreshDashboard error', e);
         }

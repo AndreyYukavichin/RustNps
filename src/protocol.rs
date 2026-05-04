@@ -2,7 +2,6 @@ use crate::model::ClientRuntimeConfig;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 
 const MAGIC: &[u8; 4] = b"RNP1";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -103,7 +102,7 @@ impl Link {
     }
 }
 
-pub fn write_message<T: Serialize>(stream: &mut TcpStream, value: &T) -> io::Result<()> {
+pub fn write_message<T: Serialize>(stream: &mut impl Write, value: &T) -> io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(invalid_data)?;
     if bytes.len() > MAX_FRAME {
         return Err(io::Error::new(
@@ -117,7 +116,7 @@ pub fn write_message<T: Serialize>(stream: &mut TcpStream, value: &T) -> io::Res
     stream.flush()
 }
 
-pub fn read_message<T: DeserializeOwned>(stream: &mut TcpStream) -> io::Result<T> {
+pub fn read_message<T: DeserializeOwned>(stream: &mut impl Read) -> io::Result<T> {
     let mut magic = [0_u8; 4];
     stream.read_exact(&mut magic)?;
     if &magic != MAGIC {

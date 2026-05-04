@@ -6,7 +6,10 @@
 //! - server/client: server/client runtime
 //! - relay/socks5: data-plane helpers
 
+#![recursion_limit = "256"]
+
 pub mod client;
+pub mod bridge_transport;
 pub mod config;
 pub mod logging;
 pub mod model;

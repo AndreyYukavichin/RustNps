@@ -304,6 +304,8 @@ pub struct Host {
     #[serde(default)]
     pub client_vkey: String,
     #[serde(default)]
+    pub proto_version: String,
+    #[serde(default)]
     pub no_store: bool,
     #[serde(default)]
     pub is_close: bool,
@@ -325,6 +327,7 @@ impl Default for Host {
             key_file_path: String::new(),
             target: Target::default(),
             client_vkey: String::new(),
+            proto_version: String::new(),
             no_store: true,
             is_close: false,
             auto_https: false,

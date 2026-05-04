@@ -8,7 +8,7 @@ use axum::{
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -700,15 +700,16 @@ fn render_client_fields(registry: &Registry, session: &WebSession, id: u64) -> S
         clients.values().find(|client| client.id == id).cloned()
     };
     let (vkey, remark, user, pass, web_user, web_pass, compress, crypt, rate_limit, flow_limit, max_conn, max_tunnel, config_conn_allow, ip_white, ip_white_pass, ip_white_list, black_ip_list) = current
+        .as_ref()
         .map(|client| {
-            let info = client.common.client;
+            let info = &client.common.client;
             (
-                client.common.vkey,
-                info.remark,
-                info.basic_username,
-                info.basic_password,
-                info.web_username,
-                info.web_password,
+                client.common.vkey.clone(),
+                info.remark.clone(),
+                info.basic_username.clone(),
+                info.basic_password.clone(),
+                info.web_username.clone(),
+                info.web_password.clone(),
                 info.compress,
                 info.crypt,
                 info.rate_limit_kb.to_string(),
@@ -717,7 +718,7 @@ fn render_client_fields(registry: &Registry, session: &WebSession, id: u64) -> S
                 info.max_tunnel_num.to_string(),
                 info.config_conn_allow,
                 info.ip_white,
-                info.ip_white_pass,
+                info.ip_white_pass.clone(),
                 info.ip_white_list.join("\n"),
                 info.black_ip_list.join("\n"),
             )
@@ -749,6 +750,10 @@ fn render_client_fields(registry: &Registry, session: &WebSession, id: u64) -> S
     let config_conn_allow_no = if config_conn_allow { "" } else { "selected" };
     let ip_white_yes = if ip_white { "selected" } else { "" };
     let ip_white_no = if ip_white { "" } else { "selected" };
+    let health_summary = current
+        .as_ref()
+        .map(|client| render_client_health_summary(registry, client))
+        .unwrap_or_default();
     let limit_fields = if session.is_admin {
         let mut html = String::new();
         if registry.server.allow_flow_limit {
@@ -790,8 +795,9 @@ fn render_client_fields(registry: &Registry, session: &WebSession, id: u64) -> S
         )
     };
     format!(
-        r#"{vkey_field}<div class="form-group"><label langtag="word-remark"></label><input class="form-control" name="remark" value="{remark}"></div>{limit_fields}<div class="form-group"><label langtag="word-basicusername"></label><input class="form-control" name="u" value="{user}"></div><div class="form-group"><label langtag="word-basicpassword"></label><input class="form-control" name="p" value="{pass}"></div>{web_user_field}<div class="form-group"><label langtag="word-webpassword"></label><input class="form-control" name="web_password" value="{web_pass}"></div><div class="form-group"><label langtag="word-connectbyconfig"></label><select class="form-control" name="config_conn_allow"><option value="1" {config_conn_allow_yes} langtag="word-yes"></option><option value="0" {config_conn_allow_no} langtag="word-no"></option></select></div><div class="form-group"><label>Compress</label><div><label><input type="checkbox" name="compress" value="1" {compress_checked}> snappy</label></div></div><div class="form-group"><label>Crypt</label><div><label><input type="checkbox" name="crypt" value="1" {crypt_checked}> TLS relay</label></div></div><div class="form-group"><label langtag="word-ipwhite"></label><select class="form-control" id="ipwhite" name="ipwhite"><option value="0" {ip_white_no} langtag="word-no"></option><option value="1" {ip_white_yes} langtag="word-yes"></option></select></div><div class="form-group" id="ip_white_pass_group"><label langtag="word-ipwhitepass"></label><input class="form-control" name="ipwhitepass" value="{ip_white_pass}"><span class="help-block m-b-none" langtag="info-ipwhitepass"></span></div><div class="form-group" id="ip_white_list_group"><label langtag="word-ipwhitelist"></label><textarea class="form-control" rows="4" name="ipwhitelist">{ip_white_list}</textarea></div><div class="form-group" id="black_ip_list_group"><label langtag="word-blackiplist"></label><textarea class="form-control" rows="4" name="blackiplist">{black_ip_list}</textarea></div><script>(function(){{function syncIpWhite(){{var enabled=$('#ipwhite').val()==='1';$('#ip_white_pass_group').toggle(enabled);$('#ip_white_list_group').toggle(enabled);$('#black_ip_list_group').toggle(!enabled);}}$('#ipwhite').on('change',syncIpWhite);syncIpWhite();}})();</script>"#,
+        r#"{vkey_field}<div class="form-group"><label langtag="word-remark"></label><input class="form-control" name="remark" value="{remark}"></div>{health_summary}{limit_fields}<div class="form-group"><label langtag="word-basicusername"></label><input class="form-control" name="u" value="{user}"></div><div class="form-group"><label langtag="word-basicpassword"></label><input class="form-control" name="p" value="{pass}"></div>{web_user_field}<div class="form-group"><label langtag="word-webpassword"></label><input class="form-control" name="web_password" value="{web_pass}"></div><div class="form-group"><label langtag="word-connectbyconfig"></label><select class="form-control" name="config_conn_allow"><option value="1" {config_conn_allow_yes} langtag="word-yes"></option><option value="0" {config_conn_allow_no} langtag="word-no"></option></select></div><div class="form-group"><label>Compress</label><div><label><input type="checkbox" name="compress" value="1" {compress_checked}> snappy</label></div></div><div class="form-group"><label>Crypt</label><div><label><input type="checkbox" name="crypt" value="1" {crypt_checked}> TLS relay</label></div></div><div class="form-group"><label langtag="word-ipwhite"></label><select class="form-control" id="ipwhite" name="ipwhite"><option value="0" {ip_white_no} langtag="word-no"></option><option value="1" {ip_white_yes} langtag="word-yes"></option></select></div><div class="form-group" id="ip_white_pass_group"><label langtag="word-ipwhitepass"></label><input class="form-control" name="ipwhitepass" value="{ip_white_pass}"><span class="help-block m-b-none" langtag="info-ipwhitepass"></span></div><div class="form-group" id="ip_white_list_group"><label langtag="word-ipwhitelist"></label><textarea class="form-control" rows="4" name="ipwhitelist">{ip_white_list}</textarea></div><div class="form-group" id="black_ip_list_group"><label langtag="word-blackiplist"></label><textarea class="form-control" rows="4" name="blackiplist">{black_ip_list}</textarea></div><script>(function(){{function syncIpWhite(){{var enabled=$('#ipwhite').val()==='1';$('#ip_white_pass_group').toggle(enabled);$('#ip_white_list_group').toggle(enabled);$('#black_ip_list_group').toggle(!enabled);}}$('#ipwhite').on('change',syncIpWhite);syncIpWhite();}})();</script>"#,
         remark = html_escape(&remark),
+        health_summary = health_summary,
         limit_fields = limit_fields,
         user = html_escape(&user),
         pass = html_escape(&pass),
@@ -805,6 +811,56 @@ fn render_client_fields(registry: &Registry, session: &WebSession, id: u64) -> S
         ip_white_pass = html_escape(&ip_white_pass),
         ip_white_list = html_escape(&ip_white_list),
         black_ip_list = html_escape(&black_ip_list),
+    )
+}
+
+fn render_client_health_summary(registry: &Registry, client: &crate::model::ClientRuntimeConfig) -> String {
+    if client.healths.is_empty() {
+        return String::new();
+    }
+
+    let removed_targets = server::client_health_down_targets(registry, &client.common.vkey);
+    let mut unique_targets = HashSet::new();
+    let mut down_targets = Vec::new();
+    let mut rules = String::new();
+
+    for health in &client.healths {
+        let mut rule_down = Vec::new();
+        let mut rule_up = Vec::new();
+        for target in &health.targets {
+            unique_targets.insert(target.clone());
+            if removed_targets.contains(target) {
+                rule_down.push(target.clone());
+                down_targets.push(target.clone());
+            } else {
+                rule_up.push(target.clone());
+            }
+        }
+        rules.push_str(&format!(
+            r#"<li><strong>{}</strong> {}s / timeout {}s / max_failed {} / down {} / up {}<br><span class="text-muted">{}</span></li>"#,
+            html_escape(&health.remark),
+            health.interval_secs,
+            health.timeout_secs,
+            health.max_failed,
+            rule_down.len(),
+            rule_up.len(),
+            html_escape(&health.targets.join("\n")),
+        ));
+    }
+
+    let state = if down_targets.is_empty() { "healthy" } else { "degraded" };
+    let mut distinct_down = down_targets;
+    distinct_down.sort();
+    distinct_down.dedup();
+
+    format!(
+        r#"<div class="form-group"><label>Health Summary</label><div class="alert alert-info" style="margin-bottom:10px"><div><strong>Status:</strong> {state}</div><div><strong>Rules:</strong> {rule_count}</div><div><strong>Targets:</strong> {target_count}</div><div><strong>Down:</strong> {down_count}</div><div><strong>Down targets:</strong> {down_targets}</div></div><ul class="list-unstyled" style="margin-top:8px">{rules}</ul></div>"#,
+        state = state,
+        rule_count = client.healths.len(),
+        target_count = unique_targets.len(),
+        down_count = distinct_down.len(),
+        down_targets = html_escape(&distinct_down.join("\n")),
+        rules = rules,
     )
 }
 
@@ -823,6 +879,9 @@ fn render_host_fields(registry: &Registry, session: &WebSession, id: u64, client
     let scheme_https = selected(&host.scheme, "https");
     let local_proxy_yes = if host.target.local_proxy { "selected" } else { "" };
     let local_proxy_no = if host.target.local_proxy { "" } else { "selected" };
+    let proto_v1 = selected(&host.proto_version, "V1");
+    let proto_v2 = selected(&host.proto_version, "V2");
+    let proto_empty = if host.proto_version.trim().is_empty() { "selected" } else { "" };
     let auto_https_yes = if host.auto_https { "selected" } else { "" };
     let auto_https_no = if host.auto_https { "" } else { "selected" };
     let client_field = render_client_binding_field(registry, session, client_id, Some(host.client_vkey.as_str()));
@@ -831,8 +890,9 @@ fn render_host_fields(registry: &Registry, session: &WebSession, id: u64, client
     } else {
         String::new()
     };
+    let proto_field = format!(r#"<div class="form-group"><label>Proxy Protocol Version</label><select class="form-control" name="proto_version"><option value="" {proto_empty}></option><option value="V1" {proto_v1}>V1</option><option value="V2" {proto_v2}>V2</option></select></div>"#);
     format!(
-        r#"{client_field}<div class="form-group"><label langtag="word-remark"></label><input class="form-control" name="remark" value="{remark}"></div><div class="form-group"><label langtag="word-host"></label><input class="form-control" name="host" value="{host_name}"></div><div class="form-group"><label langtag="word-scheme"></label><select class="form-control" id="scheme_select" name="scheme"><option value="all" {scheme_all}>all</option><option value="http" {scheme_http}>http</option><option value="https" {scheme_https}>https</option></select></div><div class="form-group" id="auto_https_group"><label>Auto HTTPS (301)</label><select class="form-control" name="AutoHttps"><option value="0" {auto_https_no} langtag="word-no"></option><option value="1" {auto_https_yes} langtag="word-yes"></option></select></div><div class="form-group" id="cert_file_group"><label>Cert file</label><textarea class="form-control" name="cert_file_path" rows="6">{cert}</textarea></div><div class="form-group" id="key_file_group"><label>Key file</label><textarea class="form-control" name="key_file_path" rows="6">{key}</textarea></div><div class="form-group"><label langtag="word-location"></label><input class="form-control" name="location" value="{location}"></div>{local_proxy_field}<div class="form-group"><label langtag="word-target"></label><textarea class="form-control" rows="4" name="target">{target}</textarea></div><div class="form-group"><label langtag="word-requestheader"></label><textarea class="form-control" rows="4" name="header">{header}</textarea></div><div class="form-group"><label langtag="word-requesthost"></label><input class="form-control" name="hostchange" value="{host_change}"></div><script>(function(){{function syncScheme(){{var tls=$('#scheme_select').val()!=='http';$('#cert_file_group').toggle(tls);$('#key_file_group').toggle(tls);$('#auto_https_group').toggle(tls);}}$('#scheme_select').on('change',syncScheme);syncScheme();}})();</script>"#,
+        r#"{client_field}<div class="form-group"><label langtag="word-remark"></label><input class="form-control" name="remark" value="{remark}"></div><div class="form-group"><label langtag="word-host"></label><input class="form-control" name="host" value="{host_name}"></div><div class="form-group"><label langtag="word-scheme"></label><select class="form-control" id="scheme_select" name="scheme"><option value="all" {scheme_all}>all</option><option value="http" {scheme_http}>http</option><option value="https" {scheme_https}>https</option></select></div><div class="form-group" id="auto_https_group"><label>Auto HTTPS (301)</label><select class="form-control" name="AutoHttps"><option value="0" {auto_https_no} langtag="word-no"></option><option value="1" {auto_https_yes} langtag="word-yes"></option></select></div><div class="form-group" id="cert_file_group"><label>Cert file</label><textarea class="form-control" name="cert_file_path" rows="6">{cert}</textarea></div><div class="form-group" id="key_file_group"><label>Key file</label><textarea class="form-control" name="key_file_path" rows="6">{key}</textarea></div><div class="form-group"><label langtag="word-location"></label><input class="form-control" name="location" value="{location}"></div>{local_proxy_field}{proto_field}<div class="form-group"><label langtag="word-target"></label><textarea class="form-control" rows="4" name="target">{target}</textarea></div><div class="form-group"><label langtag="word-requestheader"></label><textarea class="form-control" rows="4" name="header">{header}</textarea></div><div class="form-group"><label langtag="word-requesthost"></label><input class="form-control" name="hostchange" value="{host_change}"></div><script>(function(){{function syncScheme(){{var tls=$('#scheme_select').val()!=='http';$('#cert_file_group').toggle(tls);$('#key_file_group').toggle(tls);$('#auto_https_group').toggle(tls);}}$('#scheme_select').on('change',syncScheme);syncScheme();}})();</script>"#,
         client_field = client_field,
         target = html_escape(&host.target.target_str),
         location = html_escape(&host.location),
@@ -840,6 +900,7 @@ fn render_host_fields(registry: &Registry, session: &WebSession, id: u64, client
         host_change = html_escape(&host.host_change),
         header = html_escape(&host.header_change),
         local_proxy_field = local_proxy_field,
+        proto_field = proto_field,
         auto_https_no = auto_https_no,
         auto_https_yes = auto_https_yes,
         host_name = html_escape(&host.host),

@@ -1,21 +1,8 @@
 # RustNps 文档
 
-RustNps 是 Go 版 `nps/npc` 的 Rust 重构工程，目标是保留原版的使用方式和主要配置习惯，同时逐步把控制面、数据面、Web 管理和协议能力迁移到 Rust 实现。
+这组文档是 RustNps 的技术入口页，重点放在配置、架构、协议、持久化和 Web 管理面的实现说明。用户手册和快速开始请优先看仓库根目录的 [README.md](../README.md)。
 
-当前版本已经覆盖以下核心能力：
-
-- `nps` 服务端 / `npc` 客户端基础运行
-- TCP、UDP、HTTP 代理、SOCKS5、secret、p2p fallback、file 模式
-- Web 管理页与基础 API
-- 域名代理 HTTP 路由
-- HTTPS 监听、TLS 终止、SNI 多证书选择
-- `https_just_proxy=true` 时按 SNI 透传 HTTPS 到内网服务
-- Rust 版 bridge mux 连接复用
-- `compress` / `crypt` 数据面包装，支持 snappy 压缩和 TLS relay
-- `ip_limit` 访问控制，以及 `npc register` / Web 登录自动登记来源 IP
-- `allow_rate_limit` / `allow_flow_limit` 的运行时限速和流量封顶
-
-建议阅读顺序：
+## 适合先读的页面
 
 1. [install.md](install.md)
 2. [run.md](run.md)
@@ -23,7 +10,16 @@ RustNps 是 Go 版 `nps/npc` 的 Rust 重构工程，目标是保留原版的使
 4. [example.md](example.md)
 5. [nps_extend.md](nps_extend.md)
 
-说明：
+## 状态入口
+
+- 功能对标和实现位置： [feature_map.md](feature_map.md)
+- 重构待办和优先级： [refactor_todos.md](refactor_todos.md)
+- 架构总览： [architecture.md](architecture.md)
+- Web 管理页说明： [web_ui.md](web_ui.md)
+- 持久化与迁移： [persistence.md](persistence.md)
+- Docker 镜像与发布： [docker.md](docker.md)
+
+## 说明
 
 - RustNps 的配置字段尽量兼容 Go 版 `nps.conf` / `npc.conf`
 - 当前 HTTPS 域名代理优先支持 HTTP/1.1，浏览器通常会自动回落到 HTTP/1.1
