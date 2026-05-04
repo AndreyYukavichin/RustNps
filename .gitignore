@@ -1,3 +1,42 @@
+# Rust build outputs
 /target/
+**/target/
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.lib
+*.o
+*.obj
 *.pdb
+*.profraw
+*.profdata
+
+# Release / packaging artifacts
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+*.gz
+
+# Temporary test and runtime data
+/.tmp-auth-e2e/
+/test-e2e/output/
+/test-e2e/tmp/
+/tmp/
+/temp/
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Local tool / installer files
 rustup-init.exe
+*.exe.cache
+
+# Editor and OS clutter
+.DS_Store
+Thumbs.db
+*.kate-swp
